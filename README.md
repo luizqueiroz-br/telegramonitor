@@ -60,7 +60,10 @@ Dashboard no terminal (atualiza a cada 2 s, lendo só o SQLite):
 make dash
 ```
 
-Teclas: `q` sai, `p` pausa/retoma o feed, `r` recarrega do zero. Pode deixar
+Teclas: `s` alterna feed/estatísticas, `t` troca a janela (1 h → 24 h → 7 d →
+tudo), `q` sai, `p` pausa/retoma, `r` recarrega do zero. As estatísticas
+(total, chats, remetentes, links, top chats/remetentes, tipos, domínios e
+mensagens por hora UTC) atualizam a cada ~5 s; `p` congela tudo. Pode deixar
 rodando ao lado do monitor — o banco usa WAL para leitura concorrente.
 
 Ou consulte direto, se tiver o `sqlite3` instalado:
