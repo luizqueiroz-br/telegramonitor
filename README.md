@@ -73,6 +73,18 @@ Pode deixar rodando ao lado do monitor — o banco usa WAL para leitura
 concorrente. Documentação completa da TUI (abas, filtros, detalhe e
 solução de problemas): [`telegram_cti_monitor/TUI.md`](telegram_cti_monitor/TUI.md).
 
+### Agente de links (opcional)
+
+Com uma chave do OpenRouter (`OPENROUTER_API_KEY`), o `make run` também liga um
+agente que lê os links `t.me` já gravados e classifica o grupo com um modelo
+barato. Com `AGENT_AUTO_JOIN=true`, ele entra sozinho nos aprovados; por padrão
+só classifica. Ele usa a mesma sessão do monitor e respeita limites
+conservadores por hora/dia (contando tentativas) para reduzir risco de ban.
+
+Comece em modo de revisão (`AGENT_AUTO_JOIN=false`) e veja a tabela
+`group_candidates`. Guia completo, variáveis, limites e riscos:
+[`telegram_cti_monitor/AGENTE.md`](telegram_cti_monitor/AGENTE.md).
+
 Ou consulte direto, se tiver o `sqlite3` instalado:
 
 ```bash

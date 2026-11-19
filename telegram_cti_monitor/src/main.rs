@@ -11,10 +11,14 @@
  *   SESSION_PATH         arquivo de sessão (padrão: monitor.session)
  *   CTI_API_URL          URL da API CTI (opcional; vazio = só console)
  *   MONITORED_CHATS      ids de chat separados por vírgula (vazio = todos)
+ *   OPENROUTER_API_KEY   liga o agente de links (opcional)
+ *   OPENROUTER_MODEL     modelo do agente (padrão: google/gemini-2.5-flash)
+ *   AGENT_*              limites e comportamento do agente (ver AGENTE.md)
  *
  * Uso: `make setup`, depois `make run`.
  */
 
+mod agent;
 mod dash;
 mod stats;
 
@@ -632,6 +636,30 @@ impl MessageStore {
                 avatar_photo_id INTEGER,
                 avatar_path TEXT,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS group_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link TEXT NOT NULL UNIQUE,
+                kind TEXT,
+                target TEXT,
+                source_chat TEXT,
+                source_text TEXT,
+                target_title TEXT,
+                target_about TEXT,
+                target_kind TEXT,
+                participants INTEGER,
+                flagged INTEGER,
+                score REAL,
+                verdict TEXT,
+                reason TEXT,
+                model TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                tries INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                checked_at TEXT,
+                attempted_at TEXT,
+                joined_at TEXT
             );",
         )
         .await
@@ -1183,6 +1211,20 @@ async fn run() -> Result<(), String> {
     let pool_task = tokio::spawn(runner.run());
 
     ensure_logged_in(&client, &mut config).await?;
+
+    // O agente roda no mesmo processo/sessão: o Telegram não aceita duas
+    // sessões simultâneas com o mesmo arquivo.
+    if let Some(agent_config) = agent::Config::from_env(&dotenv) {
+        match MessageStore::open(&config.db_path).await {
+            Ok(agent_store) => {
+                let agent_client = client.clone();
+                tokio::spawn(async move {
+                    agent::run(agent_client, agent_store, agent_config).await;
+                });
+            }
+            Err(e) => eprintln!("[agente] desativado: {e}"),
+        }
+    }
 
     // Listar os chats da conta (mostra os ids e popula o cache de peers dos updates)
     println!("\nChats da conta:");

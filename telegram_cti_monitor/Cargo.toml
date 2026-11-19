@@ -8,7 +8,7 @@ tokio = { version = "1.38", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 jiff = "0.2"
-grammers-client = { version = "0.12", default-features = false }
+grammers-client = { version = "0.12", default-features = false, features = ["parse_invite_link"] }
 grammers-session = { version = "0.12", features = ["sqlite-storage"] }
 libsql = { version = "0.10", default-features = false, features = ["core"] }
 ratatui = "0.29"
