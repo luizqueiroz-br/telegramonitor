@@ -70,7 +70,8 @@ cancela), `g` escolhe o chat (busca por título ou id), `m` escolhe o tipo, `l`
 liga/desliga "só com links" e `c` limpa tudo. Setas, PgUp/PgDn, Home/End
 navegam; Enter abre o detalhe com todos os campos da mensagem (Esc volta).
 Pode deixar rodando ao lado do monitor — o banco usa WAL para leitura
-concorrente.
+concorrente. Documentação completa da TUI (abas, filtros, detalhe e
+solução de problemas): [`telegram_cti_monitor/TUI.md`](telegram_cti_monitor/TUI.md).
 
 Ou consulte direto, se tiver o `sqlite3` instalado:
 

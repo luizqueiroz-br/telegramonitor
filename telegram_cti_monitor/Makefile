@@ -3,7 +3,7 @@ SHELL := /bin/bash
 BIN := target/release/telegram_cti_monitor
 CARGO ?= cargo
 
-.PHONY: help setup build run check clean messages dash export logout distclean
+.PHONY: help setup build run check test clean messages dash export logout distclean
 
 help: ## Mostra os comandos disponíveis
 	@echo "Telegram CTI Monitor"
@@ -23,6 +23,9 @@ run: build ## Compila e executa o monitor (o primeiro run pede o código)
 
 check: ## Checagem rápida de compilação
 	@$(CARGO) check
+
+test: ## Roda os testes
+	@$(CARGO) test
 
 messages: build ## Mostra as últimas mensagens gravadas no SQLite
 	@./$(BIN) dump
