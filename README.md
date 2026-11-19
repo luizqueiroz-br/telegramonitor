@@ -54,6 +54,15 @@ Toda mensagem monitorada é gravada em `messages.db` (SQLite). Para listar as
 make messages
 ```
 
+Dashboard no terminal (atualiza a cada 2 s, lendo só o SQLite):
+
+```bash
+make dash
+```
+
+Teclas: `q` sai, `p` pausa/retoma o feed, `r` recarrega do zero. Pode deixar
+rodando ao lado do monitor — o banco usa WAL para leitura concorrente.
+
 Ou consulte direto, se tiver o `sqlite3` instalado:
 
 ```bash
