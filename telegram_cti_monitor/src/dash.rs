@@ -399,7 +399,7 @@ async fn browse_key(app: &mut App, code: KeyCode, store: &MessageStore) -> Resul
         }
         KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home
         | KeyCode::End => navigate(app, code),
-        KeyCode::Enter => open_detail(app, store).await?,
+        KeyCode::Enter if app.view == View::Feed => open_detail(app, store).await?,
         _ => {}
     }
     Ok(Action::Continue)
