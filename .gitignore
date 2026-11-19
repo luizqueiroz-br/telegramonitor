@@ -1,0 +1,8 @@
+telegram_cti_monitor/target/
+telegram_cti_monitor/.env
+telegram_cti_monitor/*.session
+telegram_cti_monitor/*.session-wal
+telegram_cti_monitor/*.session-shm
+telegram_cti_monitor/*.db
+telegram_cti_monitor/*.db-wal
+telegram_cti_monitor/*.db-shm
