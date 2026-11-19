@@ -16,6 +16,7 @@
  */
 
 mod dash;
+mod stats;
 
 use std::collections::HashMap;
 use std::io::{self, BufRead as _, Write as _};
