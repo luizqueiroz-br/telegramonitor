@@ -15,6 +15,8 @@
  * Uso: `make setup`, depois `make run`.
  */
 
+mod dash;
+
 use std::collections::HashMap;
 use std::io::{self, BufRead as _, Write as _};
 use std::process::Command;
@@ -1271,6 +1273,7 @@ async fn main() {
     let result = match std::env::args().nth(1).as_deref() {
         Some("dump") => dump_messages().await,
         Some("export") => export_messages(std::env::args().nth(2)).await,
+        Some("dash") => dash::run().await,
         _ => run().await,
     };
     if let Err(e) = result {

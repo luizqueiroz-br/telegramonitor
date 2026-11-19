@@ -11,3 +11,5 @@ jiff = "0.2"
 grammers-client = { version = "0.12", default-features = false }
 grammers-session = { version = "0.12", features = ["sqlite-storage"] }
 libsql = { version = "0.10", default-features = false, features = ["core"] }
+ratatui = "0.29"
+crossterm = "0.28"
