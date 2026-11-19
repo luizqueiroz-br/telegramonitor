@@ -74,9 +74,29 @@ make export      # cria messages-export.db
 Abra o `messages-export.db` no visualizador. Rode `make export` de novo quando
 quiser atualizar a cópia.
 
-A tabela `messages` tem: `message_id`, `sender_id`, `sender_username`,
-`chat_id`, `chat_title`, `timestamp`, `message_text`, `message_type`,
-`has_links`, `has_hashes`, `action_type` e `saved_at`.
+A tabela `messages` guarda o envelope completo: identidade da mensagem,
+remetente (nome, `@username`, telefone quando visível, bot/verificado/scam),
+chat (título, `@username`, tipo), mídia (nome/MIME/tamanho/duração), dados
+estruturados (localização, contato, enquete), forward/resposta e contadores
+(views, forwards, respostas, reações). A lista oficial de colunas está em
+`MESSAGE_COLUMNS` no código e em [API_CTI.md](API_CTI.md).
+
+## Catálogo de remetentes e chats
+
+O update do Telegram já traz os objetos de usuário/chat, então eles são
+catalogados **sem chamada extra** nas tabelas `users` e `chats` do mesmo
+`messages.db` (id, `@username`, nome/título, tipo e flags).
+
+As fotos de perfil são baixadas **uma única vez por entidade** e ficam em:
+
+```
+avatars/user-<id>.jpg
+avatars/chat-<id>.jpg
+```
+
+Se a foto já está no catálogo (mesmo `photo_id`), o monitor não consulta o
+Telegram de novo; se o usuário trocar a foto, a nova é baixada na próxima
+mensagem. Entidades sem foto são marcadas para não serem consultadas de novo.
 
 ## Como funciona
 

@@ -29,19 +29,79 @@ da próxima). Responda rápido; trabalho pesado deve ser assíncrono.
 
 ## Campos do JSON
 
-| Campo | Tipo | Obrigatório | Descrição |
-|---|---|---|---|
-| `message_id` | inteiro | sim | id da mensagem dentro do chat |
-| `sender_id` | inteiro | sim | id do remetente no formato Bot API; `0` quando desconhecido (post de canal, admin anônimo) |
-| `sender_username` | string ou `null` | sim | `@` sem o arroba; `null` para muitos grupos/canais |
-| `chat_id` | inteiro | sim | id do chat no formato Bot API: usuário positivo; grupo `-123456`; supergrupo/canal `-100...` |
-| `chat_title` | string | sim | nome do remetente (chat privado) ou título do grupo/canal |
-| `timestamp` | string | sim | data da mensagem, ISO 8601/RFC 3339 em UTC (ex.: `2026-11-19T14:30:00Z`) |
-| `message_text` | string | sim | texto ou legenda da mídia; `""` em mensagens de serviço |
-| `message_type` | string | sim | `text`, `photo`, `document`, `sticker`, `link`, `poll`, `location`, `contact` ou `other` |
-| `has_links` | booleano | sim | `true` se o texto contém `http://`, `https://` ou `t.me/` |
-| `has_hashes` | booleano | sim | reservado; hoje sempre `false` |
-| `action_type` | string | sim | `post`, `reply` (resposta a outra mensagem) ou `forward` |
+Todas as chaves sempre aparecem; valores desconhecidos vêm como `null`.
+
+### Mensagem e chat
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `message_id` | inteiro | id da mensagem dentro do chat |
+| `chat_id` | inteiro | id no formato Bot API: usuário positivo; grupo `-123456`; supergrupo/canal `-100...` |
+| `chat_title` | string | nome do remetente (chat privado) ou título do grupo/canal |
+| `chat_username` | string ou `null` | `@` sem arroba, quando público |
+| `chat_kind` | string | `user`, `group`, `channel`, `community` ou `unknown` |
+| `timestamp` | string | data da mensagem, ISO 8601/RFC 3339 em UTC (ex.: `2026-11-19T14:30:00Z`) |
+| `message_text` | string | texto ou legenda da mídia; `""` em mensagens de serviço |
+| `message_type` | string | `text`, `photo`, `document`, `sticker`, `link`, `poll`, `location`, `contact` ou `other` |
+| `action_type` | string | `post`, `reply` (resposta a outra mensagem) ou `forward` |
+| `has_links` | booleano | `true` se o texto contém `http://`, `https://` ou `t.me/` |
+| `has_hashes` | booleano | reservado; hoje sempre `false` |
+
+### Remetente
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `sender_id` | inteiro | id no formato Bot API; `0` quando desconhecido (post de canal, admin anônimo) |
+| `sender_username` | string ou `null` | `@` sem arroba |
+| `sender_first_name` | string ou `null` | primeiro nome / nome do canal |
+| `sender_last_name` | string ou `null` | sobrenome |
+| `sender_phone` | string ou `null` | telefone, quando o Telegram expõe (contato salvo) |
+| `sender_is_bot` | booleano | conta é bot |
+| `sender_is_verified` | booleano | conta verificada |
+| `sender_is_scam` | booleano | marcada como golpe pelo Telegram |
+| `sender_is_deleted` | booleano | conta excluída |
+
+### Mídia
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `media_name` | string ou `null` | nome do arquivo (documentos/áudio/vídeo) |
+| `media_mime` | string ou `null` | MIME type |
+| `media_size` | inteiro ou `null` | tamanho em bytes |
+| `media_duration` | número ou `null` | duração em segundos (áudio/vídeo) |
+
+O **conteúdo binário** da mídia não é baixado nem enviado; só os metadados.
+Fotos de perfil de remetentes e chats são baixadas uma vez para `avatars/` no
+lado do monitor (ver "Catálogo" abaixo), mas não vão no JSON.
+
+### Conteúdo estruturado
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `geo_lat` / `geo_lon` | número ou `null` | coordenadas de localização/venue |
+| `venue_title` | string ou `null` | nome do local |
+| `venue_address` | string ou `null` | endereço do local |
+| `contact_name` | string ou `null` | nome do contato compartilhado |
+| `contact_phone` | string ou `null` | telefone do contato compartilhado |
+| `poll_question` | string ou `null` | pergunta da enquete |
+| `poll_answers` | string ou `null` | opções separadas por ` \| ` |
+
+### Encadeamento e métricas
+
+| Campo | Tipo | Descrição |
+|---|---|---|
+| `forward_from_id` | inteiro ou `null` | chat/autor original do forward (formato Bot API) |
+| `forward_from_name` | string ou `null` | nome exibido no forward (canais ocultos) |
+| `forward_date` | string ou `null` | data original, ISO 8601 |
+| `reply_to_message_id` | inteiro ou `null` | id da mensagem respondida |
+| `reply_quote` | string ou `null` | trecho citado na resposta |
+| `view_count` | inteiro ou `null` | visualizações |
+| `forward_count` | inteiro ou `null` | forwards |
+| `reply_count` | inteiro ou `null` | respostas |
+| `reaction_count` | inteiro ou `null` | total de reações |
+| `grouped_id` | inteiro ou `null` | id do álbum, quando a mensagem faz parte de um |
+| `post_author` | string ou `null` | assinatura do autor (canais) |
+| `edit_date` | string ou `null` | data da última edição, ISO 8601 |
 
 Observações:
 
@@ -49,22 +109,58 @@ Observações:
   (o monitor não filtra remetente).
 - O JSON é compacto (sem espaços/quebras) e os campos aparecem na ordem acima.
 - A tabela `messages` do `messages.db` local espelha exatamente esses campos.
+- O monitor mantém localmente `users`/`chats` (catálogo) e `avatars/`; nada
+  disso é enviado no POST. Se a CTI precisar de fotos, crie um endpoint
+  separado e o monitor passa a enviá-las sob demanda.
 
 ## Exemplo de requisição
 
 ```json
 {
   "message_id": 12345,
-  "sender_id": 987654321,
-  "sender_username": "fulano",
   "chat_id": -1001234567890,
   "chat_title": "Grupo de Ofertas",
+  "chat_username": "grupodeofertas",
+  "chat_kind": "channel",
   "timestamp": "2026-11-19T14:30:00Z",
   "message_text": "Oferta relâmpago: http://exemplo.com/promo",
   "message_type": "text",
+  "action_type": "post",
   "has_links": true,
   "has_hashes": false,
-  "action_type": "post"
+  "sender_id": 987654321,
+  "sender_username": "fulano",
+  "sender_first_name": "Fulano",
+  "sender_last_name": "De Tal",
+  "sender_phone": null,
+  "sender_is_bot": false,
+  "sender_is_verified": false,
+  "sender_is_scam": true,
+  "sender_is_deleted": false,
+  "media_name": null,
+  "media_mime": null,
+  "media_size": null,
+  "media_duration": null,
+  "geo_lat": null,
+  "geo_lon": null,
+  "venue_title": null,
+  "venue_address": null,
+  "contact_name": null,
+  "contact_phone": null,
+  "poll_question": null,
+  "poll_answers": null,
+  "forward_from_id": null,
+  "forward_from_name": null,
+  "forward_date": null,
+  "reply_to_message_id": null,
+  "reply_quote": null,
+  "view_count": 150,
+  "forward_count": 12,
+  "reply_count": 3,
+  "reaction_count": 7,
+  "grouped_id": null,
+  "post_author": null,
+  "edit_date": null
 }
 ```
 
@@ -125,9 +221,10 @@ podem conter telefones, nomes e links de vítimas.
 ## Implementação de referência (FastAPI)
 
 ```python
+import json
 import sqlite3
-from fastapi import FastAPI
-from pydantic import BaseModel
+
+from fastapi import FastAPI, HTTPException, Request
 
 app = FastAPI()
 db = sqlite3.connect("cti.db", check_same_thread=False)
@@ -135,47 +232,31 @@ db.execute("""
 CREATE TABLE IF NOT EXISTS messages (
   chat_id INTEGER NOT NULL,
   message_id INTEGER NOT NULL,
-  sender_id INTEGER,
-  sender_username TEXT,
-  chat_title TEXT,
-  timestamp TEXT,
-  message_text TEXT,
-  message_type TEXT,
-  has_links INTEGER,
-  has_hashes INTEGER,
-  action_type TEXT,
   received_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  raw_json TEXT NOT NULL,
   PRIMARY KEY (chat_id, message_id)
 )
 """)
 
-class Message(BaseModel):
-    message_id: int
-    sender_id: int
-    sender_username: str | None = None
-    chat_id: int
-    chat_title: str
-    timestamp: str
-    message_text: str
-    message_type: str
-    has_links: bool
-    has_hashes: bool
-    action_type: str
-
 @app.post("/api/telegram/message")
-def receive(msg: Message):
+async def receive(request: Request):
+    payload = await request.json()
+    for key in ("chat_id", "message_id", "timestamp", "message_text"):
+        if key not in payload:
+            raise HTTPException(status_code=400, detail=f"campo ausente: {key}")
     db.execute(
-        "INSERT OR IGNORE INTO messages (chat_id, message_id, sender_id,"
-        " sender_username, chat_title, timestamp, message_text, message_type,"
-        " has_links, has_hashes, action_type)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (msg.chat_id, msg.message_id, msg.sender_id, msg.sender_username,
-         msg.chat_title, msg.timestamp, msg.message_text, msg.message_type,
-         msg.has_links, msg.has_hashes, msg.action_type),
+        "INSERT OR IGNORE INTO messages (chat_id, message_id, raw_json)"
+        " VALUES (?, ?, ?)",
+        (payload["chat_id"], payload["message_id"],
+         json.dumps(payload, ensure_ascii=False)),
     )
     db.commit()
     return {"ok": True}
 ```
+
+Guardar o JSON cru não perde nenhum campo novo. Depois você pode criar
+colunas/índices (por `sender_username`, `chat_id`, `timestamp`) e preenchê-las
+a partir de `raw_json`, ou trocar por um `INSERT` com as colunas desejadas.
 
 Rodar e configurar no monitor (`.env`):
 

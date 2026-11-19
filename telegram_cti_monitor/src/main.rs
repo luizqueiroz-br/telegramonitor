@@ -21,11 +21,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 use grammers_client::media::Media;
-use grammers_client::peer::Peer;
+use grammers_client::peer::{Peer, User};
 use grammers_client::sender::UpdatesConfiguration;
+use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
+use grammers_session::types::PeerRef;
 use serde::{Deserialize, Serialize};
 
 // ============================================================
@@ -167,25 +169,406 @@ fn ensure_api_credentials(config: &mut Config) -> Result<(), String> {
 // MODELO DE DADOS
 // ============================================================
 
-/// Dados de uma mensagem monitorada - salvar na API CTI
+/// Dados de uma mensagem monitorada - salvar na API CTI.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct MonitoredMessage {
     message_id: i64,
-    sender_id: i64,
-    sender_username: Option<String>,
     chat_id: i64,
     chat_title: String,
+    chat_username: Option<String>,
+    chat_kind: String, // "user", "group", "channel", "community", "unknown"
     timestamp: String, // ISO 8601: 2026-11-14T14:30:00Z
     message_text: String,
     message_type: String, // "text", "photo", "document", "link", ...
+    action_type: String,  // "post", "reply", "forward"
     has_links: bool,
     has_hashes: bool,
-    action_type: String, // "post", "reply", "forward"
+
+    sender_id: i64,
+    sender_username: Option<String>,
+    sender_first_name: Option<String>,
+    sender_last_name: Option<String>,
+    sender_phone: Option<String>,
+    sender_is_bot: bool,
+    sender_is_verified: bool,
+    sender_is_scam: bool,
+    sender_is_deleted: bool,
+
+    media_name: Option<String>,
+    media_mime: Option<String>,
+    media_size: Option<i64>,
+    media_duration: Option<f64>,
+
+    geo_lat: Option<f64>,
+    geo_lon: Option<f64>,
+    venue_title: Option<String>,
+    venue_address: Option<String>,
+    contact_name: Option<String>,
+    contact_phone: Option<String>,
+    poll_question: Option<String>,
+    poll_answers: Option<String>,
+
+    forward_from_id: Option<i64>,
+    forward_from_name: Option<String>,
+    forward_date: Option<String>,
+    reply_to_message_id: Option<i64>,
+    reply_quote: Option<String>,
+
+    view_count: Option<i64>,
+    forward_count: Option<i64>,
+    reply_count: Option<i64>,
+    reaction_count: Option<i64>,
+    grouped_id: Option<i64>,
+    post_author: Option<String>,
+    edit_date: Option<String>,
+}
+
+/// Colunas da tabela `messages`, na mesma ordem de [`MonitoredMessage::row_values`].
+/// A lista única gera o CREATE e migra bancos antigos.
+const MESSAGE_COLUMNS: &[(&str, &str)] = &[
+    ("message_id", "INTEGER NOT NULL"),
+    ("chat_id", "INTEGER NOT NULL"),
+    ("chat_title", "TEXT"),
+    ("chat_username", "TEXT"),
+    ("chat_kind", "TEXT"),
+    ("timestamp", "TEXT"),
+    ("message_text", "TEXT"),
+    ("message_type", "TEXT"),
+    ("action_type", "TEXT"),
+    ("has_links", "INTEGER"),
+    ("has_hashes", "INTEGER"),
+    ("sender_id", "INTEGER"),
+    ("sender_username", "TEXT"),
+    ("sender_first_name", "TEXT"),
+    ("sender_last_name", "TEXT"),
+    ("sender_phone", "TEXT"),
+    ("sender_is_bot", "INTEGER"),
+    ("sender_is_verified", "INTEGER"),
+    ("sender_is_scam", "INTEGER"),
+    ("sender_is_deleted", "INTEGER"),
+    ("media_name", "TEXT"),
+    ("media_mime", "TEXT"),
+    ("media_size", "INTEGER"),
+    ("media_duration", "REAL"),
+    ("geo_lat", "REAL"),
+    ("geo_lon", "REAL"),
+    ("venue_title", "TEXT"),
+    ("venue_address", "TEXT"),
+    ("contact_name", "TEXT"),
+    ("contact_phone", "TEXT"),
+    ("poll_question", "TEXT"),
+    ("poll_answers", "TEXT"),
+    ("forward_from_id", "INTEGER"),
+    ("forward_from_name", "TEXT"),
+    ("forward_date", "TEXT"),
+    ("reply_to_message_id", "INTEGER"),
+    ("reply_quote", "TEXT"),
+    ("view_count", "INTEGER"),
+    ("forward_count", "INTEGER"),
+    ("reply_count", "INTEGER"),
+    ("reaction_count", "INTEGER"),
+    ("grouped_id", "INTEGER"),
+    ("post_author", "TEXT"),
+    ("edit_date", "TEXT"),
+];
+
+fn opt_text(value: &Option<String>) -> libsql::Value {
+    match value {
+        Some(text) => libsql::Value::Text(text.clone()),
+        None => libsql::Value::Null,
+    }
+}
+
+fn opt_int(value: Option<i64>) -> libsql::Value {
+    match value {
+        Some(number) => libsql::Value::Integer(number),
+        None => libsql::Value::Null,
+    }
+}
+
+fn opt_real(value: Option<f64>) -> libsql::Value {
+    match value {
+        Some(number) => libsql::Value::Real(number),
+        None => libsql::Value::Null,
+    }
+}
+
+fn opt_str(value: Option<&str>) -> Option<String> {
+    value.map(str::to_string)
+}
+
+impl MonitoredMessage {
+    fn row_values(&self) -> Vec<libsql::Value> {
+        vec![
+            libsql::Value::Integer(self.message_id),
+            libsql::Value::Integer(self.chat_id),
+            libsql::Value::Text(self.chat_title.clone()),
+            opt_text(&self.chat_username),
+            libsql::Value::Text(self.chat_kind.clone()),
+            libsql::Value::Text(self.timestamp.clone()),
+            libsql::Value::Text(self.message_text.clone()),
+            libsql::Value::Text(self.message_type.clone()),
+            libsql::Value::Text(self.action_type.clone()),
+            libsql::Value::Integer(self.has_links as i64),
+            libsql::Value::Integer(self.has_hashes as i64),
+            libsql::Value::Integer(self.sender_id),
+            opt_text(&self.sender_username),
+            opt_text(&self.sender_first_name),
+            opt_text(&self.sender_last_name),
+            opt_text(&self.sender_phone),
+            libsql::Value::Integer(self.sender_is_bot as i64),
+            libsql::Value::Integer(self.sender_is_verified as i64),
+            libsql::Value::Integer(self.sender_is_scam as i64),
+            libsql::Value::Integer(self.sender_is_deleted as i64),
+            opt_text(&self.media_name),
+            opt_text(&self.media_mime),
+            opt_int(self.media_size),
+            opt_real(self.media_duration),
+            opt_real(self.geo_lat),
+            opt_real(self.geo_lon),
+            opt_text(&self.venue_title),
+            opt_text(&self.venue_address),
+            opt_text(&self.contact_name),
+            opt_text(&self.contact_phone),
+            opt_text(&self.poll_question),
+            opt_text(&self.poll_answers),
+            opt_int(self.forward_from_id),
+            opt_text(&self.forward_from_name),
+            opt_text(&self.forward_date),
+            opt_int(self.reply_to_message_id),
+            opt_text(&self.reply_quote),
+            opt_int(self.view_count),
+            opt_int(self.forward_count),
+            opt_int(self.reply_count),
+            opt_int(self.reaction_count),
+            opt_int(self.grouped_id),
+            opt_text(&self.post_author),
+            opt_text(&self.edit_date),
+        ]
+    }
+}
+
+/// Detalhes extraídos do objeto de mídia (sem download).
+#[derive(Default)]
+struct MediaDetails {
+    name: Option<String>,
+    mime: Option<String>,
+    size: Option<i64>,
+    duration: Option<f64>,
+    geo_lat: Option<f64>,
+    geo_lon: Option<f64>,
+    venue_title: Option<String>,
+    venue_address: Option<String>,
+    contact_name: Option<String>,
+    contact_phone: Option<String>,
+    poll_question: Option<String>,
+    poll_answers: Option<String>,
+}
+
+fn text_with_entities(value: &tl::enums::TextWithEntities) -> String {
+    match value {
+        tl::enums::TextWithEntities::Entities(text) => text.text.clone(),
+    }
+}
+
+fn media_details(media: Option<&Media>) -> MediaDetails {
+    let mut details = MediaDetails::default();
+    match media {
+        Some(Media::Photo(photo)) => details.size = photo.size().map(|s| s as i64),
+        Some(Media::Document(document)) => {
+            details.name = opt_str(document.name());
+            details.mime = opt_str(document.mime_type());
+            details.size = document.size().map(|s| s as i64);
+            details.duration = document.duration();
+        }
+        Some(Media::Contact(contact)) => {
+            let name = format!("{} {}", contact.first_name(), contact.last_name())
+                .trim()
+                .to_string();
+            details.contact_name = (!name.is_empty()).then_some(name);
+            details.contact_phone = Some(contact.phone_number().to_string());
+        }
+        Some(Media::Geo(geo)) => {
+            details.geo_lat = Some(geo.latitue());
+            details.geo_lon = Some(geo.longitude());
+        }
+        Some(Media::Venue(venue)) => {
+            details.venue_title = Some(venue.title().to_string());
+            details.venue_address = Some(venue.address().to_string());
+        }
+        Some(Media::Poll(poll)) => {
+            details.poll_question = Some(text_with_entities(poll.question()));
+            let answers: Vec<String> = poll
+                .iter_answers()
+                .map(|answer| text_with_entities(&answer.text()))
+                .collect();
+            details.poll_answers = (!answers.is_empty()).then(|| answers.join(" | "));
+        }
+        _ => {}
+    }
+    details
+}
+
+/// Converte um Peer do TL para o id no formato Bot API (mesmo dos campos chat_id/sender_id).
+fn raw_peer_dialog_id(peer: &tl::enums::Peer) -> i64 {
+    match peer {
+        tl::enums::Peer::User(user) => user.user_id,
+        tl::enums::Peer::Chat(chat) => -chat.chat_id,
+        tl::enums::Peer::Channel(channel) => -(1_000_000_000_000 + channel.channel_id),
+    }
+}
+
+fn unix_to_iso(seconds: i32) -> Option<String> {
+    jiff::Timestamp::from_second(seconds as i64)
+        .ok()
+        .map(|timestamp| timestamp.to_string())
 }
 
 // ============================================================
 // BANCO LOCAL (SQLite)
 // ============================================================
+
+const AVATAR_DIR: &str = "avatars";
+
+/// Adiciona colunas que faltam em bancos criados por versões anteriores.
+async fn ensure_columns(
+    conn: &libsql::Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> Result<(), String> {
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .map_err(|e| format!("Falha ao ler o esquema de '{table}': {e}"))?;
+    let mut existing = std::collections::HashSet::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| format!("Falha ao ler o esquema de '{table}': {e}"))?
+    {
+        if let Ok(name) = row.get::<String>(1) {
+            existing.insert(name);
+        }
+    }
+    drop(rows);
+
+    for (name, kind) in columns {
+        if !existing.contains(*name) {
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {name} {kind}"),
+                (),
+            )
+            .await
+            .map_err(|e| format!("Falha ao migrar '{table}': {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Baixa a foto de perfil indicada para `path`. Devolve `false` se não achar.
+async fn download_avatar(
+    client: &Client,
+    peer_ref: PeerRef,
+    wanted_photo_id: i64,
+    path: &str,
+) -> Result<bool, String> {
+    let mut photos = client.iter_profile_photos(peer_ref);
+    while let Some(photo) = photos
+        .next()
+        .await
+        .map_err(|e| format!("consulta de fotos: {e}"))?
+    {
+        if photo.id() != wanted_photo_id {
+            continue;
+        }
+        let mut download = client.iter_download(&photo);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = download
+            .next()
+            .await
+            .map_err(|e| format!("download da foto: {e}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+        }
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| format!("criar pasta '{}': {e}", dir.display()))?;
+        }
+        tokio::fs::write(path, bytes)
+            .await
+            .map_err(|e| format!("gravar '{path}': {e}"))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn chat_photo_id(peer: &Peer) -> Option<i64> {
+    match peer {
+        Peer::User(user) => user.photo().map(|photo| photo.photo_id),
+        Peer::Group(group) => group.photo().map(|photo| photo.photo_id),
+        Peer::Channel(channel) => channel.photo().map(|photo| photo.photo_id),
+        Peer::Community(community) => community.photo().map(|photo| photo.photo_id),
+    }
+}
+
+/// Baixa a foto só quando ela ainda não está no catálogo (uma vez por entidade).
+async fn ensure_user_avatar(
+    client: &Client,
+    store: &MessageStore,
+    user: &User,
+    peer_ref: Option<PeerRef>,
+) {
+    let id = user.id().bot_api_dialog_id_unchecked();
+    let wanted = user.photo().map(|photo| photo.photo_id).unwrap_or(0);
+    if store.avatar_photo_id("users", id).await == Some(wanted) {
+        return;
+    }
+    if wanted == 0 {
+        let _ = store.set_avatar("users", id, 0, None).await;
+        return;
+    }
+    let Some(peer_ref) = peer_ref else { return };
+    let path = format!("{AVATAR_DIR}/user-{id}.jpg");
+    match download_avatar(client, peer_ref, wanted, &path).await {
+        Ok(true) => {
+            let _ = store.set_avatar("users", id, wanted, Some(&path)).await;
+        }
+        Ok(false) => {
+            let _ = store.set_avatar("users", id, 0, None).await;
+        }
+        Err(e) => eprintln!("[aviso] foto do usuário {id}: {e}"),
+    }
+}
+
+/// Mesma ideia de [`ensure_user_avatar`], para grupos/canais.
+async fn ensure_chat_avatar(
+    client: &Client,
+    store: &MessageStore,
+    peer: &Peer,
+    peer_ref: Option<PeerRef>,
+) {
+    let id = peer.id().bot_api_dialog_id_unchecked();
+    let wanted = chat_photo_id(peer).unwrap_or(0);
+    if store.avatar_photo_id("chats", id).await == Some(wanted) {
+        return;
+    }
+    if wanted == 0 {
+        let _ = store.set_avatar("chats", id, 0, None).await;
+        return;
+    }
+    let Some(peer_ref) = peer_ref else { return };
+    let path = format!("{AVATAR_DIR}/chat-{id}.jpg");
+    match download_avatar(client, peer_ref, wanted, &path).await {
+        Ok(true) => {
+            let _ = store.set_avatar("chats", id, wanted, Some(&path)).await;
+        }
+        Ok(false) => {
+            let _ = store.set_avatar("chats", id, 0, None).await;
+        }
+        Err(e) => eprintln!("[aviso] foto do chat {id}: {e}"),
+    }
+}
 
 struct MessageStore {
     conn: libsql::Connection,
@@ -204,58 +587,166 @@ impl MessageStore {
         conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;")
             .await
             .map_err(|e| format!("Falha ao configurar o banco '{}': {e}", path))?;
+        let columns = MESSAGE_COLUMNS
+            .iter()
+            .map(|(name, kind)| format!("{name} {kind}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL,
-                sender_id INTEGER,
-                sender_username TEXT,
-                chat_id INTEGER NOT NULL,
-                chat_title TEXT,
-                timestamp TEXT,
-                message_text TEXT,
-                message_type TEXT,
-                has_links INTEGER,
-                has_hashes INTEGER,
-                action_type TEXT,
-                saved_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(chat_id, message_id)
-            )",
+            &format!(
+                "CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, {columns},
+                    saved_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, message_id)
+                )"
+            ),
             (),
         )
         .await
         .map_err(|e| format!("Falha ao criar a tabela messages: {e}"))?;
+        ensure_columns(&conn, "messages", MESSAGE_COLUMNS).await?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                phone TEXT,
+                is_bot INTEGER,
+                is_verified INTEGER,
+                is_scam INTEGER,
+                is_deleted INTEGER,
+                avatar_photo_id INTEGER,
+                avatar_path TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                username TEXT,
+                kind TEXT,
+                avatar_photo_id INTEGER,
+                avatar_path TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .await
+        .map_err(|e| format!("Falha ao criar as tabelas de catálogo: {e}"))?;
+
         Ok(Self { conn })
     }
 
     /// Grava a mensagem. Mensagens repetidas (catch-up) são ignoradas.
     async fn insert(&self, msg: &MonitoredMessage) -> Result<(), String> {
-        let username = match &msg.sender_username {
-            Some(u) => libsql::Value::Text(u.clone()),
-            None => libsql::Value::Null,
-        };
+        let columns = MESSAGE_COLUMNS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = MESSAGE_COLUMNS
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO messages (
-                    message_id, sender_id, sender_username, chat_id, chat_title,
-                    timestamp, message_text, message_type, has_links, has_hashes, action_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    msg.message_id,
-                    msg.sender_id,
-                    username,
-                    msg.chat_id,
-                    msg.chat_title.clone(),
-                    msg.timestamp.clone(),
-                    msg.message_text.clone(),
-                    msg.message_type.clone(),
-                    msg.has_links,
-                    msg.has_hashes,
-                    msg.action_type.clone()
-                ],
+                &format!("INSERT OR IGNORE INTO messages ({columns}) VALUES ({marks})"),
+                libsql::params_from_iter(msg.row_values()),
             )
             .await
             .map_err(|e| format!("Falha ao gravar no banco: {e}"))?;
+        Ok(())
+    }
+
+    /// Catálogo de usuários: dados vindos dos próprios updates (sem chamada extra).
+    async fn upsert_user(&self, user: &User) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO users (id, username, first_name, last_name, phone,
+                    is_bot, is_verified, is_scam, is_deleted, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 ON CONFLICT(id) DO UPDATE SET
+                    username = excluded.username,
+                    first_name = excluded.first_name,
+                    last_name = excluded.last_name,
+                    phone = COALESCE(excluded.phone, users.phone),
+                    is_bot = excluded.is_bot,
+                    is_verified = excluded.is_verified,
+                    is_scam = excluded.is_scam,
+                    is_deleted = excluded.is_deleted,
+                    updated_at = CURRENT_TIMESTAMP",
+                libsql::params![
+                    user.id().bot_api_dialog_id_unchecked(),
+                    opt_text(&opt_str(user.username())),
+                    opt_text(&opt_str(user.first_name())),
+                    opt_text(&opt_str(user.last_name())),
+                    opt_text(&opt_str(user.phone())),
+                    user.is_bot() as i64,
+                    user.verified() as i64,
+                    user.scam() as i64,
+                    user.deleted() as i64,
+                ],
+            )
+            .await
+            .map_err(|e| format!("Falha ao catalogar usuário: {e}"))?;
+        Ok(())
+    }
+
+    /// Catálogo de grupos/canais. Usuários são ignorados (vão para `users`).
+    async fn upsert_chat(&self, peer: &Peer) -> Result<(), String> {
+        let (title, username, kind) = match peer {
+            Peer::Group(group) => (group.title().unwrap_or("").to_string(), opt_str(group.username()), "group"),
+            Peer::Channel(channel) => (channel.title().to_string(), opt_str(channel.username()), "channel"),
+            Peer::Community(community) => (community.title().to_string(), None, "community"),
+            Peer::User(_) => return Ok(()),
+        };
+        self.conn
+            .execute(
+                "INSERT INTO chats (id, title, username, kind, updated_at)
+                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    username = excluded.username,
+                    kind = excluded.kind,
+                    updated_at = CURRENT_TIMESTAMP",
+                libsql::params![
+                    peer.id().bot_api_dialog_id_unchecked(),
+                    title,
+                    opt_text(&username),
+                    kind,
+                ],
+            )
+            .await
+            .map_err(|e| format!("Falha ao catalogar chat: {e}"))?;
+        Ok(())
+    }
+
+    /// Qual foto já foi baixada para a entidade (0 = verificado, sem foto).
+    async fn avatar_photo_id(&self, table: &str, id: i64) -> Option<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!("SELECT avatar_photo_id FROM {table} WHERE id = ?"),
+                libsql::params![id],
+            )
+            .await
+            .ok()?;
+        let row = rows.next().await.ok()??;
+        match row.get::<libsql::Value>(0).ok()? {
+            libsql::Value::Integer(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    async fn set_avatar(&self, table: &str, id: i64, photo_id: i64, path: Option<&str>) -> Result<(), String> {
+        self.conn
+            .execute(
+                &format!("UPDATE {table} SET avatar_photo_id = ?, avatar_path = ? WHERE id = ?"),
+                libsql::params![photo_id, opt_text(&opt_str(path)), id],
+            )
+            .await
+            .map_err(|e| format!("Falha ao salvar avatar: {e}"))?;
         Ok(())
     }
 
@@ -449,35 +940,93 @@ fn media_type(media: Option<Media>) -> &'static str {
     }
 }
 
-async fn handle_message(config: &Config, store: &MessageStore, message: grammers_client::update::Message) {
-    let chat_id = message
-        .peer_id()
-        .bot_api_dialog_id()
-        .unwrap_or_default();
+async fn handle_message(
+    client: &Client,
+    config: &Config,
+    store: &MessageStore,
+    message: grammers_client::update::Message,
+) {
+    let chat_id = message.peer_id().bot_api_dialog_id().unwrap_or_default();
 
     if !config.monitored_chats.is_empty() && !config.monitored_chats.contains(&chat_id) {
         return;
     }
 
-    let chat_title = message
-        .peer()
+    let peer = message.peer();
+    let chat_title = peer
         .and_then(|p| p.name())
         .unwrap_or("Desconhecido")
         .to_string();
+    let chat_username = peer.and_then(|p| p.username()).map(str::to_string);
+    let chat_kind = match peer {
+        Some(Peer::User(_)) => "user",
+        Some(Peer::Group(_)) => "group",
+        Some(Peer::Channel(_)) => "channel",
+        Some(Peer::Community(_)) => "community",
+        None => "unknown",
+    }
+    .to_string();
 
     let text = message.text();
     let has_links =
         text.contains("http://") || text.contains("https://") || text.contains("t.me/");
-    let message_type = media_type(message.media());
+    let media = message.media();
+    let message_type = media_type(media.clone());
+    let details = media_details(media.as_ref());
 
     let sender = message.sender();
-    let sender_username = match sender {
-        Some(Peer::User(user)) => user.username().map(|s| s.to_string()),
-        _ => None,
-    };
-    let sender_first_name = match sender {
-        Some(Peer::User(user)) => user.full_name(),
-        _ => "Desconhecido".to_string(),
+    let (
+        sender_username,
+        sender_first_name,
+        sender_last_name,
+        sender_phone,
+        sender_is_bot,
+        sender_is_verified,
+        sender_is_scam,
+        sender_is_deleted,
+    ) = match sender {
+        Some(Peer::User(user)) => (
+            opt_str(user.username()),
+            opt_str(user.first_name()),
+            opt_str(user.last_name()),
+            opt_str(user.phone()),
+            user.is_bot(),
+            user.verified(),
+            user.scam(),
+            user.deleted(),
+        ),
+        // Post de canal/grupo: o "remetente" é o próprio chat.
+        Some(Peer::Channel(channel)) => (
+            opt_str(channel.username()),
+            Some(channel.title().to_string()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+        ),
+        Some(Peer::Group(group)) => (
+            opt_str(group.username()),
+            group.title().map(str::to_string),
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+        ),
+        Some(Peer::Community(community)) => (
+            None,
+            Some(community.title().to_string()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+        ),
+        _ => (None, None, None, None, false, false, false, false),
     };
     let sender_id = message
         .sender_id()
@@ -492,18 +1041,68 @@ async fn handle_message(config: &Config, store: &MessageStore, message: grammers
         "post"
     };
 
+    let (forward_from_id, forward_from_name, forward_date) = match message.forward_header() {
+        Some(tl::enums::MessageFwdHeader::Header(header)) => (
+            header.from_id.as_ref().map(raw_peer_dialog_id),
+            header.from_name.clone(),
+            unix_to_iso(header.date),
+        ),
+        _ => (None, None, None),
+    };
+
+    let (reply_to_message_id, reply_quote) = match message.reply_header() {
+        Some(tl::enums::MessageReplyHeader::Header(header)) => (
+            header.reply_to_msg_id.map(|id| id as i64),
+            header.quote_text.clone(),
+        ),
+        _ => (None, None),
+    };
+
     let monitored_msg = MonitoredMessage {
         message_id: message.id() as i64,
-        sender_id,
-        sender_username: sender_username.clone(),
         chat_id,
         chat_title: chat_title.clone(),
+        chat_username,
+        chat_kind,
         timestamp: message.date().to_string(),
         message_text: text.to_string(),
         message_type: message_type.to_string(),
+        action_type: action_type.to_string(),
         has_links,
         has_hashes: false, // TODO: extrair hashes de documentos/arquivos
-        action_type: action_type.to_string(),
+        sender_id,
+        sender_username,
+        sender_first_name,
+        sender_last_name,
+        sender_phone,
+        sender_is_bot,
+        sender_is_verified,
+        sender_is_scam,
+        sender_is_deleted,
+        media_name: details.name,
+        media_mime: details.mime,
+        media_size: details.size,
+        media_duration: details.duration,
+        geo_lat: details.geo_lat,
+        geo_lon: details.geo_lon,
+        venue_title: details.venue_title,
+        venue_address: details.venue_address,
+        contact_name: details.contact_name,
+        contact_phone: details.contact_phone,
+        poll_question: details.poll_question,
+        poll_answers: details.poll_answers,
+        forward_from_id,
+        forward_from_name,
+        forward_date,
+        reply_to_message_id,
+        reply_quote,
+        view_count: message.view_count().map(|v| v as i64),
+        forward_count: message.forward_count().map(|v| v as i64),
+        reply_count: message.reply_count().map(|v| v as i64),
+        reaction_count: message.reaction_count().map(|v| v as i64),
+        grouped_id: message.grouped_id(),
+        post_author: opt_str(message.post_author()),
+        edit_date: message.edit_date().map(|date| date.to_string()),
     };
 
     if let Err(e) = store.insert(&monitored_msg).await {
@@ -516,12 +1115,37 @@ async fn handle_message(config: &Config, store: &MessageStore, message: grammers
         }
     }
 
-    println!("[+] {} [{}]:", chat_title, message_type);
-    match &sender_username {
-        Some(un) => println!("    Remetente: {} (@{})", sender_first_name, un),
-        None => println!("    Remetente: {}", sender_first_name),
+    // Catálogo: usa os objetos que já vieram no update (sem consulta extra).
+    // A foto só é baixada uma vez por entidade e fica em `avatars/`.
+    let sender_ref = message.sender_ref().await.ok().flatten();
+    let peer_ref = message.peer_ref().await.ok().flatten();
+    if let Some(Peer::User(user)) = message.sender() {
+        if let Err(e) = store.upsert_user(user).await {
+            eprintln!("[ERRO] {e}");
+        }
+        ensure_user_avatar(client, store, user, sender_ref).await;
     }
-    println!("    ID do remetente: {}", sender_id);
+    if let Some(chat_peer) = message.peer() {
+        if !matches!(chat_peer, Peer::User(_)) {
+            if let Err(e) = store.upsert_chat(chat_peer).await {
+                eprintln!("[ERRO] {e}");
+            }
+            ensure_chat_avatar(client, store, chat_peer, peer_ref).await;
+        }
+    }
+
+    let sender_display = match (
+        &monitored_msg.sender_first_name,
+        &monitored_msg.sender_username,
+    ) {
+        (Some(name), Some(username)) => format!("{name} (@{username})"),
+        (Some(name), None) => name.clone(),
+        (None, Some(username)) => format!("@{username}"),
+        (None, None) => "Desconhecido".to_string(),
+    };
+    println!("[+] {} [{}]:", chat_title, message_type);
+    println!("    Remetente: {sender_display}");
+    println!("    ID do remetente: {}", monitored_msg.sender_id);
     println!("    Conteúdo: {}", monitored_msg.message_text);
     if has_links {
         println!("    ⚠️  POSSÍVEL LINK SUSPEITO detectado!");
@@ -590,7 +1214,7 @@ async fn run() -> Result<(), String> {
             update = stream.next() => {
                 let update = update.map_err(|e| format!("Erro ao receber update: {e}"))?;
                 if let Update::NewMessage(message) = update {
-                    handle_message(&config, &store, message).await;
+                    handle_message(&client, &config, &store, message).await;
                 }
             }
         }
@@ -675,16 +1299,49 @@ mod tests {
     fn sample() -> super::MonitoredMessage {
         super::MonitoredMessage {
             message_id: 7,
-            sender_id: 42,
-            sender_username: Some("fulano".into()),
             chat_id: -100123,
             chat_title: "Grupo".into(),
+            chat_username: Some("grupo".into()),
+            chat_kind: "channel".into(),
             timestamp: "2026-11-19T12:00:00Z".into(),
             message_text: "texto http://exemplo.com".into(),
             message_type: "text".into(),
+            action_type: "post".into(),
             has_links: true,
             has_hashes: false,
-            action_type: "post".into(),
+            sender_id: 42,
+            sender_username: Some("fulano".into()),
+            sender_first_name: Some("Fulano".into()),
+            sender_last_name: Some("De Tal".into()),
+            sender_phone: None,
+            sender_is_bot: false,
+            sender_is_verified: false,
+            sender_is_scam: false,
+            sender_is_deleted: false,
+            media_name: None,
+            media_mime: None,
+            media_size: None,
+            media_duration: None,
+            geo_lat: None,
+            geo_lon: None,
+            venue_title: None,
+            venue_address: None,
+            contact_name: None,
+            contact_phone: None,
+            poll_question: None,
+            poll_answers: None,
+            forward_from_id: None,
+            forward_from_name: None,
+            forward_date: None,
+            reply_to_message_id: None,
+            reply_quote: None,
+            view_count: Some(10),
+            forward_count: Some(2),
+            reply_count: Some(1),
+            reaction_count: Some(3),
+            grouped_id: None,
+            post_author: None,
+            edit_date: None,
         }
     }
 
@@ -749,5 +1406,54 @@ mod tests {
 
         cleanup(&path);
         cleanup(&out);
+    }
+
+    #[tokio::test]
+    async fn migra_banco_criado_pela_versao_antiga() {
+        let path = temp_db();
+        {
+            let db = libsql::Builder::new_local(&path).build().await.unwrap();
+            db.connect()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id INTEGER NOT NULL,
+                        sender_id INTEGER,
+                        sender_username TEXT,
+                        chat_id INTEGER NOT NULL,
+                        chat_title TEXT,
+                        timestamp TEXT,
+                        message_text TEXT,
+                        message_type TEXT,
+                        has_links INTEGER,
+                        has_hashes INTEGER,
+                        action_type TEXT,
+                        saved_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(chat_id, message_id)
+                    );",
+                )
+                .await
+                .unwrap();
+        }
+
+        let store = super::MessageStore::open(&path).await.unwrap();
+        store.insert(&sample()).await.unwrap();
+
+        let mut rows = store
+            .conn
+            .query("SELECT sender_first_name, view_count FROM messages", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "Fulano");
+        assert_eq!(row.get::<i64>(1).unwrap(), 10);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn colunas_e_valores_na_mesma_ordem() {
+        assert_eq!(super::MESSAGE_COLUMNS.len(), sample().row_values().len());
     }
 }
