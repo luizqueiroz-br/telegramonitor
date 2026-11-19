@@ -79,6 +79,11 @@ fn iso_cutoff(hours: i64) -> String {
     (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(hours)).to_string()
 }
 
+/// Corte ISO da janela (mesmo formato de `messages.timestamp`); `None` = tudo.
+pub fn cutoff_iso(window: Window) -> Option<String> {
+    window.hours().map(iso_cutoff)
+}
+
 fn window_filter(window: Window) -> (String, Vec<libsql::Value>) {
     match window.hours() {
         Some(hours) => (
