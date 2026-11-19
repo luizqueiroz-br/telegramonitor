@@ -63,8 +63,14 @@ make dash
 Teclas: `s` alterna feed/estatísticas, `t` troca a janela (1 h → 24 h → 7 d →
 tudo), `q` sai, `p` pausa/retoma, `r` recarrega do zero. As estatísticas
 (total, chats, remetentes, links, top chats/remetentes, tipos, domínios e
-mensagens por hora UTC) atualizam a cada ~5 s; `p` congela tudo. Pode deixar
-rodando ao lado do monitor — o banco usa WAL para leitura concorrente.
+mensagens por hora UTC) atualizam a cada ~5 s; `p` congela tudo.
+
+Filtros (combináveis com a janela): `/` busca textual (Enter aplica, Esc
+cancela), `g` escolhe o chat (busca por título ou id), `m` escolhe o tipo, `l`
+liga/desliga "só com links" e `c` limpa tudo. Setas, PgUp/PgDn, Home/End
+navegam; Enter abre o detalhe com todos os campos da mensagem (Esc volta).
+Pode deixar rodando ao lado do monitor — o banco usa WAL para leitura
+concorrente.
 
 Ou consulte direto, se tiver o `sqlite3` instalado:
 
