@@ -193,6 +193,95 @@ Recomendação prática:
 Evite respostas como `{"errors":[]}` no sucesso: a palavra `error` (comparação
 literal, minúscula) faria o monitor registrar falha.
 
+## Endpoints da plataforma CTI
+
+O monitor só chama **um** endpoint (o de ingestão). Os demais são para a
+plataforma CTI consultar/gerenciar o que foi recebido. A implementação deles
+pertence ao repositório da CTI; o contrato fica fixado aqui para o monitor e a
+plataforma evoluírem juntos.
+
+| Método | Caminho | Uso |
+|---|---|---|
+| `POST` | `CTI_API_URL` (sugestão: `/api/v1/messages`) | ingestão, chamada pelo monitor |
+| `GET` | `/api/v1/messages/filter` | consulta com filtros |
+| `POST` | `/api/v1/actors` | cadastrar/atualizar ator suspeito |
+| `GET` | `/api/v1/actors/:username` | perfil de um ator |
+
+### GET /api/v1/messages/filter
+
+Query string (todos opcionais e combináveis):
+
+| Parâmetro | Tipo | Descrição |
+|---|---|---|
+| `chat_id` | inteiro | filtra pelo chat |
+| `sender_id` | inteiro | filtra pelo remetente |
+| `message_type` | string | `text`, `photo`, `document`, ... |
+| `has_links` | `true`/`false` | filtra por presença de links |
+| `from` / `to` | ISO 8601 | intervalo de `timestamp` (inclusivo) |
+| `q` | string | busca em `message_text` (substring, sem FTS) |
+| `limit` / `offset` | inteiro | paginação (padrão `limit=100`, máx. 1000) |
+
+Resposta `200`:
+
+```json
+{
+  "success": true,
+  "count": 1,
+  "limit": 100,
+  "offset": 0,
+  "items": [ { "chat_id": -1001234567890, "message_id": 12345, "timestamp": "2026-11-19T14:30:00Z", "message_text": "...", "has_links": true } ]
+}
+```
+
+Os `items` são os mesmos objetos do POST (todos os campos), ordenados por
+`timestamp` decrescente. Use `(chat_id, message_id)` como chave estável.
+
+### POST /api/v1/actors
+
+Cadastra ou atualiza (upsert por `username`) um ator monitorado.
+
+```json
+{
+  "username": "fulano",
+  "first_seen": "2026-11-01T10:00:00Z",
+  "last_seen": "2026-11-19T14:30:00Z",
+  "associated_groups": [-1001234567890, -1009876543210],
+  "tags": ["scam", "link-suspeito"]
+}
+```
+
+Resposta `200` (ou `201` na criação):
+
+```json
+{ "success": true, "stored_id": 42 }
+```
+
+### GET /api/v1/actors/:username
+
+Resposta `200`:
+
+```json
+{
+  "success": true,
+  "actor": {
+    "username": "fulano",
+    "stored_id": 42,
+    "first_seen": "2026-11-01T10:00:00Z",
+    "last_seen": "2026-11-19T14:30:00Z",
+    "associated_groups": [-1001234567890],
+    "tags": ["scam"],
+    "message_count": 137
+  }
+}
+```
+
+`404` com `{"error":"ator não encontrado"}` quando o `username` não existe.
+
+**Envelope:** toda resposta traz `success` (booleano) e, quando aplicável,
+`stored_id` (registro criado) ou `count`/`items` (consultas). Erros usam
+`{"error":"..."}` — a palavra `error` minúscula também sinaliza falha no
+monitor, conforme a seção anterior.
+
 ## Idempotência (importante)
 
 O monitor usa `catch_up`, então após reiniciar ele pode reenviar mensagens que
