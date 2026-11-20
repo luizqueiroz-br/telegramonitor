@@ -1113,6 +1113,30 @@ fn filtered_chats(app: &App) -> Vec<ChatOption> {
         .collect()
 }
 
+/// Converte a foto (JPEG) em linhas de arte ASCII.
+fn avatar_ascii(bytes: &[u8], width: u32, height: u32) -> Option<Vec<String>> {
+    let img = image::load_from_memory(bytes).ok()?.to_luma8();
+    Some(ascii_from_luma(&img, width, height))
+}
+
+/// A célula do terminal é ~2x mais alta que larga: 2 linhas de pixel por linha de texto.
+fn ascii_from_luma(img: &image::GrayImage, width: u32, height: u32) -> Vec<String> {
+    const RAMP: &[u8] = b" .:-=+*#%@";
+    let img = image::imageops::resize(img, width, height * 2, image::imageops::FilterType::Triangle);
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| {
+                    let top = img.get_pixel(x, y * 2)[0] as u16;
+                    let bottom = img.get_pixel(x, y * 2 + 1)[0] as u16;
+                    let lum = ((top + bottom) / 2) as usize;
+                    RAMP[lum * (RAMP.len() - 1) / 255] as char
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Reutiliza `MESSAGE_COLUMNS` para mostrar todos os campos não nulos.
 async fn load_detail(store: &MessageStore, row_id: i64) -> Result<Vec<(String, String)>, String> {
     let columns = MESSAGE_COLUMNS
@@ -1159,10 +1183,12 @@ async fn load_detail(store: &MessageStore, row_id: i64) -> Result<Vec<(String, S
         (MESSAGE_COLUMNS.len() as i32, "avatar do remetente"),
         (MESSAGE_COLUMNS.len() as i32 + 1, "avatar do chat"),
     ] {
-        if let Ok(libsql::Value::Blob(blob)) = row.get_value(index) {
-            if !blob.is_empty() {
-                fields.push((label.to_string(), format!("<{} bytes>", blob.len())));
-            }
+        if let Ok(libsql::Value::Blob(blob)) = row.get_value(index)
+            && !blob.is_empty()
+            && let Some(rows) = avatar_ascii(&blob, 24, 12)
+        {
+            fields.push((label.to_string(), rows.join("\n")));
+            break;
         }
     }
     Ok(fields)
@@ -1968,6 +1994,14 @@ fn render_type_picker(frame: &mut Frame, app: &App, area: Rect) {
 fn detail_lines(detail: &[(String, String)]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (name, value) in detail {
+        if name.starts_with("avatar do ") {
+            lines.push(Line::from(Span::styled(
+                format!("{name} (ASCII)"),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            lines.extend(value.lines().map(|line| Line::from(Span::raw(line.to_string()))));
+            continue;
+        }
         // Forward/reply em amarelo; links no valor também ganham destaque.
         let color = if name.starts_with("forward_") || name.starts_with("reply_") {
             Color::Yellow
@@ -2014,6 +2048,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn avatar_vira_arte_ascii() {
+        let mut img = image::GrayImage::new(8, 8);
+        for (x, _, px) in img.enumerate_pixels_mut() {
+            px[0] = if x < 4 { 0 } else { 255 };
+        }
+        let rows = ascii_from_luma(&img, 10, 5);
+        assert_eq!(rows.len(), 5);
+        assert!(rows[0].starts_with(' '), "{:?}", rows[0]);
+        assert!(rows[0].ends_with('@'), "{:?}", rows[0]);
+        assert!(rows.iter().all(|row| row.chars().count() == 10));
+        assert!(avatar_ascii(b"nao e imagem", 10, 5).is_none());
+    }
 
     fn temp_db() -> String {
         static N: AtomicUsize = AtomicUsize::new(0);

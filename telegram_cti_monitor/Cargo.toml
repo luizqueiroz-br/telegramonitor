@@ -13,3 +13,5 @@ grammers-session = { version = "0.12", features = ["sqlite-storage"] }
 libsql = { version = "0.10", default-features = false, features = ["core"] }
 ratatui = "0.29"
 crossterm = "0.28"
+# Só para desenhar os avatares como arte ASCII no dashboard.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

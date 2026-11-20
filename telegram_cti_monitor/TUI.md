@@ -138,15 +138,16 @@ incluindo os que já não estão no catálogo `chats`.
 | `q` | sai do dashboard |
 
 No feed, o detalhe mostra os campos preenchidos de `MESSAGE_COLUMNS`, mais o id
-no banco e o tamanho das fotos do remetente (`users.avatar_blob`) e do chat
-(`chats.avatar_blob`), quando existem. Nomes de `forward_*`/`reply_*` aparecem em amarelo e URLs ficam
+no banco e o avatar do remetente (`users.avatar_blob`) ou, na falta dele, o do
+chat (`chats.avatar_blob`), desenhado como **arte ASCII** (24×12 caracteres). Nomes de `forward_*`/`reply_*` aparecem em amarelo e URLs ficam
 sublinhadas. Textos longos quebram linha e podem ser rolados.
 
 Na aba Agente, o detalhe mostra link, status, score, veredito, motivo do modelo,
 título/descrição, datas e o histórico de `group_actions`.
 
-A imagem do avatar **não** é desenhada no terminal (cada terminal usa um
-protocolo diferente); o tamanho do BLOB é exibido.
+O avatar é desenhado com caracteres de sombreamento (`. :-=+*#%@`), sem depender
+de protocolo gráfico do terminal. Fotos ilegíveis ou em formato não suportado
+simplesmente não aparecem.
 
 ## Filtros
 
@@ -210,4 +211,4 @@ linha em foco é preservada.
 - Busca e filtros fazem varredura (`LIKE`/`WHERE`) no SQLite. Com um banco na
   casa das centenas de milhares de mensagens, vale criar índices em
   `timestamp` e `chat_id`.
-- Sem renderização de imagens (avatares aparecem como tamanho do BLOB).
+- Avatares apenas em arte ASCII (sem imagem real/cores).
