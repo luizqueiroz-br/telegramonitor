@@ -9,13 +9,15 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph, Sparkline, Wrap};
 
+use crate::agent::log_action;
 use crate::stats::{self, Stats, Window};
-use crate::{env_or_dotenv, load_dotenv, MessageStore, MESSAGE_COLUMNS};
+use crate::{MESSAGE_COLUMNS, MessageStore, env_or_dotenv, load_dotenv};
 
 const POLL_EVERY: Duration = Duration::from_secs(2);
 const STATS_EVERY: Duration = Duration::from_secs(5);
 const FEED_LIMIT: usize = 200;
 const LIST_LIMIT: usize = 1000;
+const AGENT_LIMIT: usize = 500;
 
 const TYPE_OPTIONS: &[&str] = &[
     "", "text", "photo", "document", "sticker", "link", "poll", "location", "contact", "other",
@@ -25,6 +27,7 @@ const TYPE_OPTIONS: &[&str] = &[
 enum View {
     Feed,
     Stats,
+    Agent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,12 +56,17 @@ struct Filters {
     chat: Option<ChatOption>,
     kind: Option<String>,
     links_only: bool,
+    hide_ads: bool,
     search: Option<String>,
 }
 
 impl Filters {
     fn active(&self) -> bool {
-        self.chat.is_some() || self.kind.is_some() || self.links_only || self.search.is_some()
+        self.chat.is_some()
+            || self.kind.is_some()
+            || self.links_only
+            || self.hide_ads
+            || self.search.is_some()
     }
 
     fn summary(&self) -> String {
@@ -71,6 +79,9 @@ impl Filters {
         }
         if self.links_only {
             parts.push("links".to_string());
+        }
+        if self.hide_ads {
+            parts.push("sem anúncios".to_string());
         }
         if let Some(search) = &self.search {
             parts.push(format!("busca=\"{}\"", truncate(search, 24)));
@@ -89,7 +100,27 @@ struct FeedRow {
     chat: String,
     sender: String,
     kind: String,
+    msg_kind: String,
     text: String,
+}
+
+#[derive(Clone)]
+struct AgentRow {
+    id: i64,
+    link: String,
+    status: String,
+    verdict: String,
+    target_title: String,
+    source_chat: String,
+    created_at: String,
+    checked_at: String,
+    score: Option<f64>,
+    reason: String,
+    error: String,
+    model: String,
+    tries: i64,
+    manual_approved: bool,
+    force_join: bool,
 }
 
 struct App {
@@ -116,6 +147,14 @@ struct App {
     picker: usize,
     detail: Option<Vec<(String, String)>>,
     detail_scroll: u16,
+
+    agent_rows: Vec<AgentRow>,
+    agent_selected: usize,
+    agent_offset: usize,
+    agent_height: usize,
+    agent_show_all: bool,
+    agent_all_total: i64,
+    agent_summary: String,
 }
 
 impl App {
@@ -143,11 +182,22 @@ impl App {
             picker: 0,
             detail: None,
             detail_scroll: 0,
+            agent_rows: Vec::new(),
+            agent_selected: 0,
+            agent_offset: 0,
+            agent_height: 1,
+            agent_show_all: false,
+            agent_all_total: 0,
+            agent_summary: String::new(),
         }
     }
 
     fn selected_row(&self) -> Option<&FeedRow> {
         self.feed.iter().rev().nth(self.selected)
+    }
+
+    fn selected_agent(&self) -> Option<&AgentRow> {
+        self.agent_rows.get(self.agent_selected)
     }
 
     fn clamp_selection(&mut self) {
@@ -183,6 +233,7 @@ pub async fn run() -> Result<(), String> {
     let mut app = App::new();
     app.chats_catalog = chat_options(&store).await?;
     reload(&mut app, &store).await?;
+    reload_agents(&mut app, &store).await?;
 
     let mut terminal = ratatui::init();
     let _restore = Restore;
@@ -198,13 +249,22 @@ pub async fn run() -> Result<(), String> {
         tokio::select! {
             _ = ticker.tick() => {
                 if !app.paused {
-                    if let Err(e) = refresh(&mut app, &store).await {
+                    // Na aba do agente o feed não aparece; pular evita apagar a
+                    // mensagem de status (aprovação/rejeição) a cada 2 s.
+                    if app.view != View::Agent
+                        && let Err(e) = refresh(&mut app, &store).await
+                    {
                         app.status = format!("erro: {e}");
                     }
                     if app.view == View::Stats && app.stats_at.elapsed() >= STATS_EVERY {
                         if let Err(e) = refresh_stats(&mut app, &store).await {
                             app.status = format!("erro: {e}");
                         }
+                    }
+                    if app.view == View::Agent
+                        && let Err(e) = reload_agents(&mut app, &store).await
+                    {
+                        app.status = format!("erro: {e}");
                     }
                 }
             }
@@ -231,14 +291,16 @@ pub async fn run() -> Result<(), String> {
 /// Lê eventos do terminal numa thread própria (a leitura é bloqueante).
 fn spawn_events() -> tokio::sync::mpsc::UnboundedReceiver<Event> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    std::thread::spawn(move || loop {
-        match event::read() {
-            Ok(event) => {
-                if tx.send(event).is_err() {
-                    break;
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(event) => {
+                    if tx.send(event).is_err() {
+                        break;
+                    }
                 }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     });
     rx
@@ -345,11 +407,30 @@ async fn handle_key(
 async fn browse_key(app: &mut App, code: KeyCode, store: &MessageStore) -> Result<Action, String> {
     match code {
         KeyCode::Char('q') => return Ok(Action::Quit),
+        KeyCode::Char('a') => {
+            app.view = if app.view == View::Agent {
+                View::Feed
+            } else {
+                View::Agent
+            };
+            if app.view == View::Agent {
+                reload_agents(app, store).await?;
+            }
+            return Ok(Action::Continue);
+        }
+        _ => {}
+    }
+    if app.view == View::Agent {
+        return agent_key(app, code, store).await;
+    }
+
+    match code {
         KeyCode::Char('p') => app.paused = !app.paused,
         KeyCode::Char('s') => {
-            app.view = match app.view {
-                View::Feed => View::Stats,
-                View::Stats => View::Feed,
+            app.view = if app.view == View::Feed {
+                View::Stats
+            } else {
+                View::Feed
             };
             if app.view == View::Stats {
                 refresh_stats(app, store).await?;
@@ -365,6 +446,10 @@ async fn browse_key(app: &mut App, code: KeyCode, store: &MessageStore) -> Resul
         }
         KeyCode::Char('l') => {
             app.filters.links_only = !app.filters.links_only;
+            reload(app, store).await?;
+        }
+        KeyCode::Char('k') => {
+            app.filters.hide_ads = !app.filters.hide_ads;
             reload(app, store).await?;
         }
         KeyCode::Char('/') => {
@@ -397,12 +482,191 @@ async fn browse_key(app: &mut App, code: KeyCode, store: &MessageStore) -> Resul
                 refresh_stats(app, store).await?;
             }
         }
-        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
         | KeyCode::End => navigate(app, code),
         KeyCode::Enter if app.view == View::Feed => open_detail(app, store).await?,
         _ => {}
     }
     Ok(Action::Continue)
+}
+
+async fn agent_key(app: &mut App, code: KeyCode, store: &MessageStore) -> Result<Action, String> {
+    match code {
+        KeyCode::Char('p') => app.paused = !app.paused,
+        KeyCode::Char('s') => {
+            app.view = View::Stats;
+            refresh_stats(app, store).await?;
+        }
+        KeyCode::Char('r') => reload_agents(app, store).await?,
+        KeyCode::Char('f') => {
+            app.agent_show_all = !app.agent_show_all;
+            reload_agents(app, store).await?;
+        }
+        KeyCode::Char('y') => decide_agent(app, store, true).await?,
+        KeyCode::Char('n') => decide_agent(app, store, false).await?,
+        KeyCode::Char('x') => retry_agent(app, store).await?,
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Home
+        | KeyCode::End => navigate_agents(app, code),
+        KeyCode::Enter => open_agent_detail(app, store).await?,
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+async fn decide_agent(app: &mut App, store: &MessageStore, approve: bool) -> Result<(), String> {
+    let Some(row) = app.selected_agent().cloned() else {
+        return Ok(());
+    };
+    if matches!(row.status.as_str(), "joined" | "already" | "duplicate") {
+        app.status = format!("'{}' não pode ser alterado", row.status);
+        return Ok(());
+    }
+    if approve {
+        let changed = store
+            .conn
+            .execute(
+                "UPDATE group_candidates SET status = 'approved', manual_approved = 1,
+                    force_join = 0, error = NULL, tries = 0
+                 WHERE id = ? AND status NOT IN ('joined','already','duplicate')",
+                libsql::params![row.id],
+            )
+            .await
+            .map_err(|e| format!("Falha ao aprovar: {e}"))?;
+        if changed == 0 {
+            app.status = "status mudou no agente; recarregando".into();
+            return reload_agents(app, store).await;
+        }
+        log_action(
+            store,
+            &row.link,
+            "manual_approve",
+            "aprovado no TUI",
+            "manual",
+        )
+        .await?;
+        app.status =
+            "aprovado: o agente entra na próxima varredura (make run, dry-run=false)".into();
+    } else {
+        let changed = store
+            .conn
+            .execute(
+                "UPDATE group_candidates SET status = 'skipped', manual_approved = 0,
+                    force_join = 0, error = 'rejeitado manualmente', tries = 0
+                 WHERE id = ? AND status NOT IN ('joined','already','duplicate')",
+                libsql::params![row.id],
+            )
+            .await
+            .map_err(|e| format!("Falha ao rejeitar: {e}"))?;
+        if changed == 0 {
+            app.status = "status mudou no agente; recarregando".into();
+            return reload_agents(app, store).await;
+        }
+        log_action(
+            store,
+            &row.link,
+            "manual_skip",
+            "rejeitado no TUI",
+            "manual",
+        )
+        .await?;
+        app.status = "rejeitado".into();
+    }
+    reload_agents(app, store).await
+}
+
+/// Reenfileira o convite ignorando o orçamento de entradas por hora/dia.
+/// FLOOD_WAIT e `AGENT_DRY_RUN` continuam valendo no agente.
+async fn retry_agent(app: &mut App, store: &MessageStore) -> Result<(), String> {
+    let Some(row) = app.selected_agent().cloned() else {
+        return Ok(());
+    };
+    if matches!(row.status.as_str(), "joined" | "already" | "duplicate") {
+        app.status = format!("'{}' não pode ser alterado", row.status);
+        return Ok(());
+    }
+    if row.status == "pending" {
+        // Sem veredito ainda: entrar à força pularia a classificação.
+        app.status = "pendente: aguarde a classificação antes do retry".into();
+        return Ok(());
+    }
+    let changed = store
+        .conn
+        .execute(
+            "UPDATE group_candidates SET status = 'approved', manual_approved = 1,
+                force_join = 1, error = NULL, tries = 0
+             WHERE id = ? AND status NOT IN ('joined','already','duplicate','pending')",
+            libsql::params![row.id],
+        )
+        .await
+        .map_err(|e| format!("Falha ao reenfileirar: {e}"))?;
+    if changed == 0 {
+        app.status = "status mudou no agente; recarregando".into();
+        return reload_agents(app, store).await;
+    }
+    log_action(
+        store,
+        &row.link,
+        "manual_retry",
+        "retry forçado no TUI (ignora limites)",
+        "manual",
+    )
+    .await?;
+    app.status =
+        "retry forçado: o agente tenta na próxima varredura, ignorando o orçamento".into();
+    reload_agents(app, store).await
+}
+
+async fn open_agent_detail(app: &mut App, store: &MessageStore) -> Result<(), String> {
+    let Some(id) = app.selected_agent().map(|row| row.id) else {
+        return Ok(());
+    };
+    app.detail = Some(load_agent_detail(store, id).await?);
+    app.detail_scroll = 0;
+    app.mode = Mode::Detail;
+    Ok(())
+}
+
+fn navigate_agents(app: &mut App, code: KeyCode) {
+    let len = app.agent_rows.len();
+    if len == 0 {
+        return;
+    }
+    let page = app.agent_height.max(1);
+    match code {
+        KeyCode::Up => app.agent_selected = app.agent_selected.saturating_sub(1),
+        KeyCode::Down => app.agent_selected = (app.agent_selected + 1).min(len - 1),
+        KeyCode::PageUp => app.agent_selected = app.agent_selected.saturating_sub(page),
+        KeyCode::PageDown => app.agent_selected = (app.agent_selected + page).min(len - 1),
+        KeyCode::Home => app.agent_selected = 0,
+        KeyCode::End => app.agent_selected = len - 1,
+        _ => {}
+    }
+    clamp_agent_selection(app);
+}
+
+fn clamp_agent_selection(app: &mut App) {
+    app.agent_selected = app
+        .agent_selected
+        .min(app.agent_rows.len().saturating_sub(1));
+    if app.agent_rows.is_empty() {
+        app.agent_offset = 0;
+        return;
+    }
+    let height = app.agent_height.max(1);
+    if app.agent_selected < app.agent_offset {
+        app.agent_offset = app.agent_selected;
+    }
+    if app.agent_selected >= app.agent_offset + height {
+        app.agent_offset = app.agent_selected + 1 - height;
+    }
 }
 
 fn navigate(app: &mut App, code: KeyCode) {
@@ -500,9 +764,118 @@ async fn refresh_stats(app: &mut App, store: &MessageStore) -> Result<(), String
     Ok(())
 }
 
+async fn load_agents(store: &MessageStore, show_all: bool) -> Result<Vec<AgentRow>, String> {
+    let filter = if show_all {
+        ""
+    } else {
+        " WHERE status NOT IN ('joined','already','duplicate')"
+    };
+    let mut rows = store
+        .conn
+        .query(
+            &format!(
+                "SELECT id, link, status, COALESCE(verdict, ''),
+                        COALESCE(target_title, ''), COALESCE(source_chat, ''),
+                        COALESCE(created_at, ''), score, COALESCE(manual_approved, 0),
+                        COALESCE(force_join, 0), COALESCE(checked_at, ''),
+                        COALESCE(reason, ''), COALESCE(error, ''), COALESCE(model, ''),
+                        COALESCE(tries, 0)
+                 FROM group_candidates{filter}
+                 ORDER BY id DESC LIMIT {AGENT_LIMIT}"
+            ),
+            (),
+        )
+        .await
+        .map_err(|e| format!("Falha ao listar convites: {e}"))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| format!("Falha ao ler convite: {e}"))?
+    {
+        let score = match row.get_value(7) {
+            Ok(libsql::Value::Real(n)) => Some(n),
+            Ok(libsql::Value::Integer(n)) => Some(n as f64),
+            _ => None,
+        };
+        out.push(AgentRow {
+            id: row.get::<i64>(0).unwrap_or(0),
+            link: row.get::<String>(1).unwrap_or_default(),
+            status: row.get::<String>(2).unwrap_or_default(),
+            verdict: row.get::<String>(3).unwrap_or_default(),
+            target_title: row.get::<String>(4).unwrap_or_default(),
+            source_chat: row.get::<String>(5).unwrap_or_default(),
+            created_at: row.get::<String>(6).unwrap_or_default(),
+            checked_at: row.get::<String>(10).unwrap_or_default(),
+            score,
+            reason: row.get::<String>(11).unwrap_or_default(),
+            error: row.get::<String>(12).unwrap_or_default(),
+            model: row.get::<String>(13).unwrap_or_default(),
+            tries: row.get::<i64>(14).unwrap_or(0),
+            manual_approved: row.get::<i64>(8).unwrap_or(0) != 0,
+            force_join: row.get::<i64>(9).unwrap_or(0) != 0,
+        });
+    }
+    Ok(out)
+}
+
+async fn agent_summary(store: &MessageStore) -> Result<(String, i64), String> {
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT status, COUNT(*) FROM group_candidates GROUP BY status",
+            (),
+        )
+        .await
+        .map_err(|e| format!("Falha ao resumir convites: {e}"))?;
+    let (mut total, mut pending, mut approved, mut joined, mut duplicate) = (0, 0, 0, 0, 0);
+    let (mut skipped, mut failed) = (0, 0);
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| format!("Falha ao resumir convites: {e}"))?
+    {
+        let status: String = row.get(0).unwrap_or_default();
+        let count: i64 = row.get(1).unwrap_or(0);
+        total += count;
+        match status.as_str() {
+            "pending" => pending += count,
+            "approved" => approved += count,
+            "joined" | "already" => joined += count,
+            "duplicate" => duplicate += count,
+            "skipped" => skipped += count,
+            "failed" | "error" => failed += count,
+            _ => {}
+        }
+    }
+    Ok((
+        format!(
+            "Convites {total} · pend. {pending} · aprov. {approved} · \
+             rejeit. {skipped} · falha {failed} · entrou/já {joined} · rep. {duplicate}"
+        ),
+        total,
+    ))
+}
+
+async fn reload_agents(app: &mut App, store: &MessageStore) -> Result<(), String> {
+    let keep_id = app.selected_agent().map(|row| row.id);
+    app.agent_rows = load_agents(store, app.agent_show_all).await?;
+    let (summary, all_total) = agent_summary(store).await?;
+    app.agent_summary = summary;
+    app.agent_all_total = all_total;
+    app.agent_selected = keep_id
+        .and_then(|id| app.agent_rows.iter().position(|row| row.id == id))
+        .unwrap_or(0)
+        .min(app.agent_rows.len().saturating_sub(1));
+    if app.agent_rows.is_empty() {
+        app.agent_offset = 0;
+    }
+    Ok(())
+}
+
 const ROW_SELECT: &str = "SELECT id, timestamp, COALESCE(chat_title, ''),
         COALESCE(sender_first_name, ''), COALESCE(sender_username, ''),
-        COALESCE(message_type, ''), COALESCE(message_text, '')
+        COALESCE(message_type, ''), COALESCE(message_text, ''), COALESCE(msg_kind, '')
     FROM messages";
 
 fn build_where(filters: &Filters, window: Window) -> (String, Vec<libsql::Value>) {
@@ -522,6 +895,9 @@ fn build_where(filters: &Filters, window: Window) -> (String, Vec<libsql::Value>
     }
     if filters.links_only {
         clauses.push("has_links = 1".to_string());
+    }
+    if filters.hide_ads {
+        clauses.push("COALESCE(msg_kind, '') != 'ad'".to_string());
     }
     if let Some(search) = &filters.search {
         // LIKE é case-insensitive para ASCII; ESCAPE evita que % e _ virem curinga.
@@ -671,6 +1047,7 @@ async fn collect_rows(rows: &mut libsql::Rows) -> Result<Vec<FeedRow>, String> {
             chat: text(2),
             sender,
             kind: text(5),
+            msg_kind: text(7),
             text: text(6),
         });
     }
@@ -749,8 +1126,8 @@ async fn load_detail(store: &MessageStore, row_id: i64) -> Result<Vec<(String, S
         .query(
             &format!(
                 "SELECT {columns},
-                    (SELECT avatar_path FROM users WHERE users.id = messages.sender_id),
-                    (SELECT avatar_path FROM chats WHERE chats.id = messages.chat_id)
+                    (SELECT avatar_blob FROM users WHERE users.id = messages.sender_id),
+                    (SELECT avatar_blob FROM chats WHERE chats.id = messages.chat_id)
                  FROM messages WHERE id = ?"
             ),
             libsql::params![row_id],
@@ -782,11 +1159,113 @@ async fn load_detail(store: &MessageStore, row_id: i64) -> Result<Vec<(String, S
         (MESSAGE_COLUMNS.len() as i32, "avatar do remetente"),
         (MESSAGE_COLUMNS.len() as i32 + 1, "avatar do chat"),
     ] {
-        if let Ok(libsql::Value::Text(path)) = row.get_value(index) {
-            if !path.is_empty() {
-                fields.push((label.to_string(), path));
+        if let Ok(libsql::Value::Blob(blob)) = row.get_value(index) {
+            if !blob.is_empty() {
+                fields.push((label.to_string(), format!("<{} bytes>", blob.len())));
             }
         }
+    }
+    Ok(fields)
+}
+
+async fn load_agent_detail(store: &MessageStore, id: i64) -> Result<Vec<(String, String)>, String> {
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT id, link, kind, target, target_kind, target_id, target_title, target_about,
+                    participants, flagged, score, verdict, reason, model, status,
+                    manual_approved, error, COALESCE(source_chat, ''),
+                    COALESCE(source_text, ''), created_at, checked_at, attempted_at, joined_at,
+                    COALESCE(tries, 0), COALESCE(force_join, 0)
+             FROM group_candidates WHERE id = ?",
+            libsql::params![id],
+        )
+        .await
+        .map_err(|e| format!("Falha ao abrir o convite: {e}"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| format!("Falha ao abrir o convite: {e}"))?
+        .ok_or("Convite não encontrado")?;
+    let labels = [
+        "id",
+        "link",
+        "tipo do link",
+        "alvo",
+        "tipo do alvo",
+        "id do chat",
+        "título",
+        "descrição",
+        "participantes",
+        "flag scam/fake",
+        "score",
+        "veredito",
+        "motivo",
+        "modelo",
+        "status",
+        "aprovado manualmente",
+        "erro",
+        "chat de origem",
+        "texto de origem",
+        "criado",
+        "analisado",
+        "tentado",
+        "entrou",
+        "tentativas",
+        "retry forçado",
+    ];
+    let mut fields = Vec::new();
+    for (index, label) in labels.iter().enumerate() {
+        let value = row
+            .get_value(index as i32)
+            .map_err(|e| format!("Falha ao ler {label}: {e}"))?;
+        let text = match value {
+            libsql::Value::Null => continue,
+            libsql::Value::Text(text) if text.is_empty() => continue,
+            libsql::Value::Text(text) => text,
+            libsql::Value::Integer(number) => number.to_string(),
+            libsql::Value::Real(number) => number.to_string(),
+            libsql::Value::Blob(blob) => format!("<{} bytes>", blob.len()),
+        };
+        let text = match *label {
+            "flag scam/fake" | "aprovado manualmente" | "retry forçado" => {
+                if text == "1" {
+                    "sim".to_string()
+                } else {
+                    "não".to_string()
+                }
+            }
+            "erro" => explain_error(&text),
+            _ => text,
+        };
+        fields.push(((*label).to_string(), text));
+    }
+    drop(rows);
+
+    let mut actions = store
+        .conn
+        .query(
+            "SELECT created_at, actor, action, COALESCE(detail, '') FROM group_actions
+             WHERE link = (SELECT link FROM group_candidates WHERE id = ?)
+             ORDER BY id DESC LIMIT 30",
+            libsql::params![id],
+        )
+        .await
+        .map_err(|e| format!("Falha ao ler o histórico: {e}"))?;
+    let mut history = Vec::new();
+    while let Some(row) = actions
+        .next()
+        .await
+        .map_err(|e| format!("Falha ao ler o histórico: {e}"))?
+    {
+        let created: String = row.get(0).unwrap_or_default();
+        let actor: String = row.get(1).unwrap_or_default();
+        let action: String = row.get(2).unwrap_or_default();
+        let detail: String = row.get(3).unwrap_or_default();
+        history.push(format!("{created} · {actor} · {action} · {detail}"));
+    }
+    if !history.is_empty() {
+        fields.push(("histórico".to_string(), history.join("\n")));
     }
     Ok(fields)
 }
@@ -800,25 +1279,56 @@ fn ui(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).split(area);
 
-    let mode = if app.paused { "⏸ pausado" } else { "● ao vivo" };
-    let hint = match app.view {
-        View::Feed => "s estatísticas",
-        View::Stats => "s ao vivo",
-    };
-    let filter_line = if app.filters.active() {
-        app.filters.summary()
+    let mode = if app.paused {
+        "⏸ pausado"
     } else {
-        "/ busca · g chat · m tipo · l links · c limpa · q sair".to_string()
+        "● ao vivo"
     };
-    let header = vec![
-        Line::from(format!(
+    let hint = match app.view {
+        View::Feed => "s estatísticas · a agente",
+        View::Stats => "s ao vivo · a agente",
+        View::Agent => "a mensagens",
+    };
+    let filter_line = match app.view {
+        View::Agent => {
+            let show = if app.agent_show_all {
+                "f filtra já entrou/rep."
+            } else {
+                "f mostra já entrou/rep."
+            };
+            format!("y aprova · n rejeita · x retry · {show} · Enter detalhe · r recarrega")
+        }
+        _ if app.filters.active() => app.filters.summary(),
+        _ => "/ busca · g chat · m tipo · l links · k anúncios · c limpa · a agente · q sair"
+            .to_string(),
+    };
+    let first_line = if app.view == View::Agent {
+        app.agent_summary.clone()
+    } else {
+        format!(
             "Mensagens {} · Chats {} · Remetentes {} · exibindo {} de {}",
             app.total,
             app.chats,
             app.senders,
             app.feed.len(),
             app.rows_total
-        )),
+        )
+    };
+    let second_line = if app.view == View::Agent {
+        format!(" · {hint} · p pausa · r recarrega")
+    } else {
+        format!(
+            " · janela {} · {hint} · t janela · p pausa · r recarrega",
+            app.window.label()
+        )
+    };
+    let third_line = if app.status.is_empty() {
+        filter_line
+    } else {
+        app.status.clone()
+    };
+    let header = vec![
+        Line::from(first_line),
         Line::from(vec![
             Span::styled(
                 mode,
@@ -828,22 +1338,19 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Color::Green
                 }),
             ),
-            Span::raw(format!(
-                " · janela {} · {hint} · t janela · p pausa · r recarrega",
-                app.window.label()
-            )),
+            Span::raw(second_line),
         ]),
-        Line::from(Span::styled(filter_line, Style::new().fg(Color::Yellow))),
+        Line::from(Span::styled(third_line, Style::new().fg(Color::Yellow))),
     ];
     frame.render_widget(
         Paragraph::new(header).block(Block::bordered().title(" Telegram CTI Monitor ")),
         chunks[0],
     );
 
-    if app.view == View::Stats {
-        ui_stats(frame, app, chunks[1]);
-    } else {
-        ui_feed(frame, app, chunks[1]);
+    match app.view {
+        View::Stats => ui_stats(frame, app, chunks[1]),
+        View::Agent => ui_agent(frame, app, chunks[1]),
+        View::Feed => ui_feed(frame, app, chunks[1]),
     }
 
     match app.mode {
@@ -911,6 +1418,169 @@ fn ui_feed(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn ui_agent(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered().title(" Agente ");
+    if app.agent_rows.is_empty() {
+        let message = if app.agent_all_total == 0 {
+            "Nenhum convite ainda. O agente precisa de OPENROUTER_API_KEY e de links t.me."
+        } else {
+            "Nenhum convite visível. Pressione f para mostrar já entrou/repetidos."
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    // Com altura suficiente, reserva o rodapé para a decisão do selecionado.
+    let (list_area, decision_area) = if area.height >= 14 {
+        let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(area);
+        (parts[0], Some(parts[1]))
+    } else {
+        (area, None)
+    };
+
+    app.agent_height = list_area.height.saturating_sub(2) as usize;
+    clamp_agent_selection(app);
+
+    let lines: Vec<Line> = app
+        .agent_rows
+        .iter()
+        .enumerate()
+        .skip(app.agent_offset)
+        .take(app.agent_height)
+        .map(|(index, row)| {
+            let mut line = agent_line(row);
+            if index == app.agent_selected {
+                line.spans.insert(0, Span::raw("▶ "));
+                line = line.style(Style::new().bg(Color::DarkGray));
+            } else {
+                line.spans.insert(0, Span::raw("  "));
+            }
+            line
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), list_area);
+
+    if let Some(decision_area) = decision_area
+        && let Some(row) = app.agent_rows.get(app.agent_selected)
+    {
+        frame.render_widget(
+            Paragraph::new(agent_decision_lines(row))
+                .wrap(Wrap { trim: true })
+                .block(Block::bordered().title(" Decisão ")),
+            decision_area,
+        );
+    }
+}
+
+/// Resumo legível da triagem do convite selecionado.
+fn agent_decision_lines(row: &AgentRow) -> Vec<Line<'static>> {
+    let score = row
+        .score
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string());
+    let verdict = match row.verdict.as_str() {
+        "fraud" => "fraude",
+        "benign" => "ok",
+        _ => "sem veredito",
+    };
+    let model = if row.model.is_empty() {
+        "modelo não informado"
+    } else {
+        row.model.as_str()
+    };
+    let checked = if row.checked_at.is_empty() {
+        "não analisado"
+    } else {
+        "analisado"
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            status_label(&row.status).to_string(),
+            Style::new().fg(status_color(&row.status)).bold(),
+        ),
+        Span::raw(format!(
+            " · score {score} ({verdict}) · {model} · {checked} {}",
+            short_time(&row.checked_at)
+        )),
+        if row.manual_approved {
+            Span::styled(" ✋ manual", Style::new().fg(Color::Yellow))
+        } else {
+            Span::raw("")
+        },
+        if row.force_join {
+            Span::styled(" ⚡ retry", Style::new().fg(Color::Red))
+        } else {
+            Span::raw("")
+        },
+    ])];
+    if !row.reason.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("motivo: ", Style::new().fg(Color::DarkGray)),
+            Span::raw(row.reason.clone()),
+        ]));
+    }
+    if !row.error.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("erro: ", Style::new().fg(Color::Red)),
+            Span::styled(explain_error(&row.error), Style::new().fg(Color::Red)),
+        ]));
+    }
+    if row.reason.is_empty() && row.error.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "sem análise ainda: aguardando o agente",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(format!(
+        "tentativas {} · origem {} · criado {}",
+        row.tries,
+        if row.source_chat.is_empty() {
+            "-"
+        } else {
+            row.source_chat.as_str()
+        },
+        short_time(&row.created_at)
+    )));
+    lines.push(Line::from(Span::styled(
+        truncate(&row.link, 100),
+        Style::new().fg(Color::Cyan),
+    )));
+    lines
+}
+
+/// Traduz os erros mais comuns do Telegram para uma frase curta.
+fn explain_error(raw: &str) -> String {
+    let known = [
+        ("PEER_FLOOD", "conta limitada por spam; entradas pausadas"),
+        ("FLOOD_WAIT", "Telegram pediu pausa (flood)"),
+        ("INVITE_HASH_EXPIRED", "convite expirado"),
+        ("INVITE_HASH_INVALID", "convite inválido"),
+        ("USER_ALREADY_PARTICIPANT", "a conta já era membro"),
+        ("CHANNEL_PRIVATE", "grupo privado ou apagado"),
+        ("CHANNEL_INVALID", "grupo não existe mais"),
+        ("CHAT_FORBIDDEN", "entrada proibida nesse grupo"),
+        ("USER_CHANNELS_TOO_MUCH", "limite de canais/grupos da conta"),
+        ("USERS_TOO_MUCH", "limite de grupos da conta"),
+        ("USER_BANNED_IN_CHANNEL", "conta banida nesse grupo"),
+        ("USERNAME_NOT_OCCUPIED", "@ não existe"),
+        ("USERNAME_INVALID", "@ inválido"),
+        ("TIMEOUT", "falha passageira de rede"),
+        ("RPC_CALL_FAILED", "falha passageira do Telegram"),
+        ("rejeitado manualmente", "rejeitado no TUI"),
+    ];
+    for (needle, text) in known {
+        if raw.contains(needle) {
+            return format!("{text} — {}", truncate(raw, 70));
+        }
+    }
+    truncate(raw, 90)
+}
+
 fn ui_stats(frame: &mut Frame, app: &App, area: Rect) {
     let Some(data) = &app.stats else {
         frame.render_widget(
@@ -928,7 +1598,7 @@ fn ui_stats(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Percentage(33),
     ])
     .split(area);
-    let left = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(cols[0]);
+    let left = Layout::vertical([Constraint::Length(7), Constraint::Min(3)]).split(cols[0]);
     let mid = Layout::vertical([Constraint::Length(12), Constraint::Min(3)]).split(cols[1]);
     let right = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(cols[2]);
 
@@ -943,6 +1613,7 @@ fn ui_stats(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(format!("Total {} · Chats {}", o.total, o.chats)),
             Line::from(format!("Remetentes {}", o.senders)),
             Line::from(format!("Links {} ({}%)", o.links, pct)),
+            Line::from(format!("Anúncios {} · Conversas {}", o.ads, o.conversations)),
             Line::from(format!("1 h {} · 24 h {}", o.last_hour, o.last_day)),
         ])
         .block(Block::bordered().title(" Visão geral ")),
@@ -1041,10 +1712,7 @@ fn type_lines(types: &[stats::TypeCount], width: usize) -> Vec<Line<'static>> {
                     Style::new().fg(Color::Magenta),
                 ),
                 Span::raw(format!("{:>5} ", kind.count)),
-                Span::styled(
-                    "█".repeat(filled.min(bar_w)),
-                    Style::new().fg(Color::Cyan),
-                ),
+                Span::styled("█".repeat(filled.min(bar_w)), Style::new().fg(Color::Cyan)),
             ])
         })
         .collect()
@@ -1061,9 +1729,115 @@ fn feed_line(row: &FeedRow) -> Line<'static> {
             format!("{:<16} ", truncate(&row.sender, 16)),
             Style::new().fg(Color::Green),
         ),
-        Span::styled(format!("[{:<8}] ", row.kind), Style::new().fg(Color::Magenta)),
+        Span::styled(
+            format!("[{:<8}] ", row.kind),
+            Style::new().fg(Color::Magenta),
+        ),
     ];
+    if row.msg_kind == "ad" {
+        spans.push(Span::styled(
+            "anúncio ",
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
     spans.extend(text_spans(&row.text));
+    Line::from(spans)
+}
+
+fn status_label(status: &str) -> &str {
+    match status {
+        "pending" => "pendente",
+        "approved" => "aprovado",
+        "joined" => "entrou",
+        "already" => "já",
+        "duplicate" => "repetido",
+        "skipped" => "rejeitado",
+        "failed" => "falhou",
+        "error" => "erro",
+        _ => status,
+    }
+}
+
+fn status_color(status: &str) -> Color {
+    match status {
+        "joined" | "approved" => Color::Green,
+        "already" => Color::Blue,
+        "pending" => Color::Yellow,
+        "failed" | "error" => Color::Red,
+        "duplicate" => Color::DarkGray,
+        "skipped" => Color::Gray,
+        _ => Color::White,
+    }
+}
+
+fn score_color(score: f64) -> Color {
+    if score >= 0.8 {
+        Color::Green
+    } else if score >= 0.5 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+fn agent_line(row: &AgentRow) -> Line<'static> {
+    let score = row
+        .score
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_string());
+    let verdict = match row.verdict.as_str() {
+        "fraud" => "fraude",
+        "benign" => "ok",
+        _ => "-",
+    };
+    let title = if row.target_title.is_empty() {
+        &row.link
+    } else {
+        &row.target_title
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!("{:<10}", status_label(&row.status)),
+            Style::new().fg(status_color(&row.status)),
+        ),
+        Span::styled(
+            format!("{score:>5} "),
+            Style::new().fg(row.score.map(score_color).unwrap_or(Color::DarkGray)),
+        ),
+        Span::styled(
+            format!("{verdict:<6} "),
+            Style::new().fg(match row.verdict.as_str() {
+                "fraud" => Color::Red,
+                "benign" => Color::Green,
+                _ => Color::Gray,
+            }),
+        ),
+        Span::raw(truncate(title, 30)),
+        Span::raw(" · "),
+        Span::styled(truncate(&row.link, 34), Style::new().fg(Color::Cyan)),
+    ];
+    if !row.source_chat.is_empty() {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled(
+            truncate(&row.source_chat, 18),
+            Style::new().fg(Color::Magenta),
+        ));
+    }
+    if row.manual_approved {
+        spans.push(Span::styled(" ✋", Style::new().fg(Color::Yellow)));
+    }
+    if row.force_join {
+        spans.push(Span::styled(" ⚡", Style::new().fg(Color::Red)));
+    }
+    if row.tries > 0 {
+        spans.push(Span::styled(
+            format!(" t{}", row.tries),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if !row.created_at.is_empty() {
+        spans.push(Span::raw(format!(" {}", short_time(&row.created_at))));
+    }
     Line::from(spans)
 }
 
@@ -1151,9 +1925,8 @@ fn render_chat_picker(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered().title(" Escolher chat (Enter seleciona · Esc cancela) "),
-        ),
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Escolher chat (Enter seleciona · Esc cancela) ")),
         popup,
     );
 }
@@ -1255,7 +2028,13 @@ mod tests {
             .to_string()
     }
 
-    async fn insert(store: &MessageStore, message_id: i64, chat_id: i64, sender_id: i64, text: &str) {
+    async fn insert(
+        store: &MessageStore,
+        message_id: i64,
+        chat_id: i64,
+        sender_id: i64,
+        text: &str,
+    ) {
         store
             .conn
             .execute(
@@ -1367,11 +2146,7 @@ mod tests {
 
         let fields = load_detail(&store, row_id).await.unwrap();
         assert!(fields.iter().any(|(name, _)| name == "message_text"));
-        assert!(
-            fields
-                .iter()
-                .any(|(_, value)| value == "texto do detalhe")
-        );
+        assert!(fields.iter().any(|(_, value)| value == "texto do detalhe"));
         assert!(!fields.iter().any(|(name, _)| name == "media_name"));
 
         cleanup(&path);
@@ -1397,6 +2172,8 @@ mod tests {
                 chats: 2,
                 senders: 3,
                 links: 2,
+                ads: 4,
+                conversations: 6,
                 last_hour: 5,
                 last_day: 9,
             },
@@ -1452,10 +2229,13 @@ mod tests {
             chat: "Chat".into(),
             sender: "ana".into(),
             kind: "text".into(),
-            text: "oi http://exemplo.com".into(),
+            msg_kind: "ad".into(),
+            text: "promoção http://exemplo.com".into(),
         });
         terminal.draw(|frame| ui(frame, &mut app)).unwrap();
-        assert!(screen_text(&terminal).contains("Ao vivo"));
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("Ao vivo"));
+        assert!(screen.contains("anúncio"));
 
         app.view = View::Stats;
         app.stats = Some(sample_stats());
@@ -1482,6 +2262,7 @@ mod tests {
             chat: "Chat".into(),
             sender: "ana".into(),
             kind: "text".into(),
+            msg_kind: String::new(),
             text: "texto".into(),
         });
         app.filters.search = Some("texto".into());
@@ -1497,5 +2278,98 @@ mod tests {
         app.input = "abc".into();
         terminal.draw(|frame| ui(frame, &mut app)).unwrap();
         assert!(screen_text(&terminal).contains("busca: abc"));
+    }
+
+    #[test]
+    fn explica_erros_conhecidos() {
+        assert!(explain_error("RPC error 420: FLOOD_WAIT (300)").contains("pausa"));
+        assert!(explain_error("PEER_FLOOD").contains("spam"));
+        assert!(explain_error("INVITE_HASH_EXPIRED").contains("expirado"));
+        assert_eq!(explain_error("algo estranho"), "algo estranho");
+    }
+
+    #[tokio::test]
+    async fn agente_filtra_ja_entrou_repetido_e_aprova_manual() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        for (link, status) in [
+            ("https://t.me/+entrou", "joined"),
+            ("https://t.me/+pendente", "pending"),
+            ("https://t.me/+repetido", "duplicate"),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO group_candidates (link, kind, target, status)
+                     VALUES (?, 'invite', ?, ?)",
+                    libsql::params![link, link, status],
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut app = App::new();
+        reload_agents(&mut app, &store).await.unwrap();
+        assert_eq!(app.agent_rows.len(), 1, "filtra joined e duplicate");
+        assert_eq!(app.agent_rows[0].link, "https://t.me/+pendente");
+
+        // Retry num link ainda não classificado não pode furar a triagem.
+        retry_agent(&mut app, &store).await.unwrap();
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT status, force_join FROM group_candidates
+                 WHERE link = 'https://t.me/+pendente'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "pending");
+        assert_eq!(row.get::<i64>(1).unwrap(), 0);
+
+        decide_agent(&mut app, &store, true).await.unwrap();
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT status, manual_approved FROM group_candidates
+                 WHERE link = 'https://t.me/+pendente'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "approved");
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+
+        retry_agent(&mut app, &store).await.unwrap();
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT status, manual_approved, force_join FROM group_candidates
+                 WHERE link = 'https://t.me/+pendente'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "approved");
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+        assert_eq!(row.get::<i64>(2).unwrap(), 1, "retry força a entrada");
+
+        app.agent_show_all = true;
+        reload_agents(&mut app, &store).await.unwrap();
+        assert_eq!(app.agent_rows.len(), 3);
+
+        app.view = View::Agent;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| ui(frame, &mut app)).unwrap();
+        let screen = screen_text(&terminal);
+        assert!(screen.contains("Agente"));
+        assert!(screen.contains("aprovado"));
+        assert!(screen.contains("repetido"));
+        assert!(screen.contains("Decisão"));
+        cleanup(&path);
     }
 }

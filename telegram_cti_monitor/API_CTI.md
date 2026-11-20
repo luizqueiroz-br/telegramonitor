@@ -13,6 +13,13 @@ Telegram (MTProto) --update--> monitor --POST JSON--> CTI_API_URL
                                    +--> messages.db (SQLite local)
 ```
 
+## Triagem anúncio/conversa
+
+Quando `OPENROUTER_API_KEY` está configurada, cada mensagem nova é classificada
+como anúncio (`ad`) ou conversa (`chat`) antes do envio. **Anúncios não geram
+POST**: ficam só no `messages.db` local (`messages.msg_kind`). Se o modelo
+falhar, a mensagem é enviada normalmente. O formato do JSON abaixo não muda.
+
 ## Requisição
 
 | Item | Valor |
@@ -71,8 +78,9 @@ Todas as chaves sempre aparecem; valores desconhecidos vêm como `null`.
 | `media_duration` | número ou `null` | duração em segundos (áudio/vídeo) |
 
 O **conteúdo binário** da mídia não é baixado nem enviado; só os metadados.
-Fotos de perfil de remetentes e chats são baixadas uma vez para `avatars/` no
-lado do monitor (ver "Catálogo" abaixo), mas não vão no JSON.
+Fotos de perfil de remetentes e chats são baixadas uma vez e guardadas no
+SQLite local como BLOB (`users.avatar_blob` / `chats.avatar_blob`), mas não vão
+no JSON.
 
 ### Conteúdo estruturado
 
@@ -109,8 +117,8 @@ Observações:
   (o monitor não filtra remetente).
 - O JSON é compacto (sem espaços/quebras) e os campos aparecem na ordem acima.
 - A tabela `messages` do `messages.db` local espelha exatamente esses campos.
-- O monitor mantém localmente `users`/`chats` (catálogo) e `avatars/`; nada
-  disso é enviado no POST. Se a CTI precisar de fotos, crie um endpoint
+- O monitor mantém localmente `users`/`chats` (catálogo, com as fotos em BLOB);
+  nada disso é enviado no POST. Se a CTI precisar de fotos, crie um endpoint
   separado e o monitor passa a enviá-las sob demanda.
 
 ## Exemplo de requisição
