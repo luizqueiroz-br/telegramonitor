@@ -31,11 +31,12 @@ O cabeçalho tem três linhas:
 
 1. totais gerais (`Mensagens`, `Chats`, `Remetentes`) e o contador
    `exibindo X de Y` da lista atual (X = carregadas, Y = total que casa com os
-   filtros/janela);
+   filtros/janela). Na aba **Agente**, mostra o resumo dos convites;
 2. status (`● ao vivo` / `⏸ pausado`), janela atual e atalhos;
-3. resumo dos filtros ativos — ou os atalhos de filtro quando não há nenhum.
+3. resumo dos filtros ativos, atalhos de filtro ou a última mensagem de status.
 
-Abaixo fica o **feed** (tecla `s` alterna para as **estatísticas**).
+Abaixo fica o **feed**. `s` alterna feed ↔ **estatísticas**; `a` abre a aba
+**Agente** (convites, análises e decisão manual).
 
 ## Teclas
 
@@ -45,12 +46,14 @@ Abaixo fica o **feed** (tecla `s` alterna para as **estatísticas**).
 |---|---|
 | `q` | sai |
 | `Ctrl+C` | sai de qualquer tela |
-| `p` | pausa/retoma as atualizações automáticas (feed e estatísticas) |
-| `s` | alterna feed ↔ estatísticas |
+| `p` | pausa/retoma as atualizações automáticas |
+| `s` | alterna feed ↔ estatísticas (na aba Agente, vai para estatísticas) |
+| `a` | abre a aba Agente / volta para o feed |
 | `t` | troca a janela: 1 h → 24 h → 7 d → tudo |
 | `r` | recarrega do zero |
 | `c` | limpa todos os filtros |
 | `l` | liga/desliga "só mensagens com links" |
+| `k` | liga/desliga "sem anúncios" (usa `messages.msg_kind`) |
 | `/` | busca textual |
 | `g` | escolhe o chat |
 | `m` | escolhe o tipo de mensagem |
@@ -81,6 +84,38 @@ A busca é em `message_text`, sem diferenciar maiúsculas de minúsculas (ASCII)
 `%` e `_` são tratados como texto, não como curinga. Termo vazio = sem filtro
 de busca.
 
+### Aba Agente (`a`)
+
+Lista os links registrados em `group_candidates`, do mais novo para o mais
+antigo. Cada linha mostra status, score, veredito, título, link, chat de origem,
+hora e tentativas. Um `✋` indica aprovação manual e `⚡` retry forçado.
+
+O cabeçalho resume os totais por estado: pendentes, aprovados, rejeitados,
+falhas, entrou/já e repetidos. O rodapé **Decisão** mostra o convite
+selecionado: status, score, veredito, modelo, motivo do modelo, erro traduzido
+(ex.: `FLOOD_WAIT` → "Telegram pediu pausa"), tentativas, origem e link.
+
+| Tecla | Ação |
+|---|---|
+| `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | navega |
+| `Enter` | detalhe com a análise, tentativas e histórico de ações |
+| `y` | aprova e enfileira a entrada |
+| `n` | rejeita (`skipped`) |
+| `x` | retry forçado: reenfileira ignorando o limite por hora (o diário vale) |
+| `f` | alterna ocultar ↔ mostrar `joined`/`already`/`duplicate` |
+| `r` | recarrega a lista |
+| `a` | volta ao feed |
+| `s` | vai para as estatísticas |
+
+Por padrão ficam ocultos os grupos em que já se entrou (`joined`/`already`) e os
+repetidos (`duplicate`). `y` grava `manual_approved=1` e uma ação
+`manual_approve`; `x` grava também `force_join=1` e a ação `manual_retry`, e o
+agente ignora o limite por hora para aquele convite (mostrado com `⚡`); o teto
+diário continua valendo. `FLOOD_WAIT`/`PEER_FLOOD` e `AGENT_DRY_RUN=true`
+continuam valendo. O
+dashboard não entra no grupo sozinho — ele não tem sessão do Telegram; o agente
+do `make run` executa na próxima varredura.
+
 ### Seletor de chat (`g`)
 
 Digite parte do título ou do id para filtrar a lista. `↑`/`↓` escolhem,
@@ -102,13 +137,16 @@ incluindo os que já não estão no catálogo `chats`.
 | `Esc` ou `Enter` | volta para a lista |
 | `q` | sai do dashboard |
 
-O detalhe mostra os campos preenchidos de `MESSAGE_COLUMNS`, mais o id no banco
-e os caminhos de avatar do remetente (`users`) e do chat (`chats`), quando
-existem. Nomes de `forward_*`/`reply_*` aparecem em amarelo e URLs ficam
+No feed, o detalhe mostra os campos preenchidos de `MESSAGE_COLUMNS`, mais o id
+no banco e o tamanho das fotos do remetente (`users.avatar_blob`) e do chat
+(`chats.avatar_blob`), quando existem. Nomes de `forward_*`/`reply_*` aparecem em amarelo e URLs ficam
 sublinhadas. Textos longos quebram linha e podem ser rolados.
 
+Na aba Agente, o detalhe mostra link, status, score, veredito, motivo do modelo,
+título/descrição, datas e o histórico de `group_actions`.
+
 A imagem do avatar **não** é desenhada no terminal (cada terminal usa um
-protocolo diferente); o caminho do arquivo é exibido.
+protocolo diferente); o tamanho do BLOB é exibido.
 
 ## Filtros
 
@@ -172,4 +210,4 @@ linha em foco é preservada.
 - Busca e filtros fazem varredura (`LIKE`/`WHERE`) no SQLite. Com um banco na
   casa das centenas de milhares de mensagens, vale criar índices em
   `timestamp` e `chat_id`.
-- Sem renderização de imagens (avatares aparecem como caminho).
+- Sem renderização de imagens (avatares aparecem como tamanho do BLOB).

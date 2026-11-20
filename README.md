@@ -60,10 +60,29 @@ Dashboard no terminal (atualiza a cada 2 s, lendo só o SQLite):
 make dash
 ```
 
-Teclas: `s` alterna feed/estatísticas, `t` troca a janela (1 h → 24 h → 7 d →
-tudo), `q` sai, `p` pausa/retoma, `r` recarrega do zero. As estatísticas
-(total, chats, remetentes, links, top chats/remetentes, tipos, domínios e
-mensagens por hora UTC) atualizam a cada ~5 s; `p` congela tudo.
+Teclas: `s` alterna feed/estatísticas, `a` abre a aba do agente (convites,
+análises e aprovação manual), `t` troca a janela (1 h → 24 h → 7 d → tudo),
+`k` oculta anúncios, `q` sai, `p` pausa/retoma, `r` recarrega do zero. As
+estatísticas (total, chats, remetentes, links, anúncios/conversas, top
+chats/remetentes, tipos, domínios e mensagens por hora UTC) atualizam a cada
+~5 s; `p` congela tudo.
+
+## Triagem anúncio/conversa
+
+Cada mensagem nova passa por um modelo do OpenRouter antes de ir para a API
+CTI, e a resposta fica em `messages.msg_kind` (`ad` ou `chat`). Anúncios
+continuam no SQLite (auditoria), mas não são enviados à API CTI; se o modelo
+falhar, a mensagem é enviada normalmente.
+
+| Variável | Descrição |
+|---|---|
+| `OPENROUTER_API_KEY` | liga a triagem (a mesma chave do agente) |
+| `OPENROUTER_MSG_MODEL` | modelo leve da triagem e da decisão de entrada do agente; padrão: `OPENROUTER_MODEL` ou `google/gemini-2.5-flash` |
+| `MSG_CLASSIFY` | `false` desliga a triagem |
+
+Escolha o modelo em <https://openrouter.ai/pt-BR/rankings/decisions>. O mesmo
+modelo leve também decide se o agente entra nos grupos. A triagem roda antes
+do envio, com timeout de 20 s por mensagem.
 
 Filtros (combináveis com a janela): `/` busca textual (Enter aplica, Esc
 cancela), `g` escolhe o chat (busca por título ou id), `m` escolhe o tipo, `l`
@@ -77,12 +96,16 @@ solução de problemas): [`telegram_cti_monitor/TUI.md`](telegram_cti_monitor/TU
 
 Com uma chave do OpenRouter (`OPENROUTER_API_KEY`), o `make run` também liga um
 agente que lê os links `t.me` já gravados e classifica o grupo com um modelo
-barato. Com `AGENT_AUTO_JOIN=true`, ele entra sozinho nos aprovados; por padrão
-só classifica. Ele usa a mesma sessão do monitor e respeita limites
-conservadores por hora/dia (contando tentativas) para reduzir risco de ban.
+barato. Com `AGENT_AUTO_JOIN=true`, ele entra sozinho nos aprovados; por padrão,
+só entra nos que você aprovar no dashboard. Ele usa a mesma sessão do monitor e
+respeita limites conservadores por hora/dia (contando tentativas) para reduzir
+risco de ban.
 
-Comece em modo de revisão (`AGENT_AUTO_JOIN=false`) e veja a tabela
-`group_candidates`. Guia completo, variáveis, limites e riscos:
+Comece em modo de revisão (`AGENT_AUTO_JOIN=false`) e abra a aba Agente do
+dashboard (`make dash`, tecla `a`): você vê as análises e aprova (`y`) ou
+rejeita (`n`) cada convite. A aprovação manual é executada pelo agente na
+próxima varredura, inclusive com `AGENT_AUTO_JOIN=false`. Já entrou/repetido
+ficam ocultos; `f` mostra tudo. Guia completo, variáveis, limites e riscos:
 [`telegram_cti_monitor/AGENTE.md`](telegram_cti_monitor/AGENTE.md).
 
 Ou consulte direto, se tiver o `sqlite3` instalado:
@@ -118,12 +141,10 @@ O update do Telegram já traz os objetos de usuário/chat, então eles são
 catalogados **sem chamada extra** nas tabelas `users` e `chats` do mesmo
 `messages.db` (id, `@username`, nome/título, tipo e flags).
 
-As fotos de perfil são baixadas **uma única vez por entidade** e ficam em:
-
-```
-avatars/user-<id>.jpg
-avatars/chat-<id>.jpg
-```
+As fotos de perfil são baixadas **uma única vez por entidade** e ficam no
+próprio banco, como BLOB, em `users.avatar_blob` e `chats.avatar_blob`
+(assim `messages-export.db` já leva as imagens). Fotos antigas em `avatars/`
+são migradas automaticamente na primeira abertura do banco.
 
 Se a foto já está no catálogo (mesmo `photo_id`), o monitor não consulta o
 Telegram de novo; se o usuário trocar a foto, a nova é baixada na próxima

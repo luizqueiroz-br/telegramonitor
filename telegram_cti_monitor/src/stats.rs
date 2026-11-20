@@ -50,6 +50,8 @@ pub struct Overview {
     pub chats: i64,
     pub senders: i64,
     pub links: i64,
+    pub ads: i64,
+    pub conversations: i64,
     pub last_hour: i64,
     pub last_day: i64,
 }
@@ -171,7 +173,9 @@ async fn overview(store: &MessageStore) -> Result<Overview, String> {
             "SELECT COUNT(*), COUNT(DISTINCT chat_id), COUNT(DISTINCT sender_id),
                     COALESCE(SUM(has_links), 0),
                     COALESCE(SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN msg_kind = 'ad' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN msg_kind = 'chat' THEN 1 ELSE 0 END), 0)
              FROM messages",
             libsql::params![iso_cutoff(1), iso_cutoff(24)],
         )
@@ -189,6 +193,8 @@ async fn overview(store: &MessageStore) -> Result<Overview, String> {
         links: row.get(3).unwrap_or(0),
         last_hour: row.get(4).unwrap_or(0),
         last_day: row.get(5).unwrap_or(0),
+        ads: row.get(6).unwrap_or(0),
+        conversations: row.get(7).unwrap_or(0),
     })
 }
 

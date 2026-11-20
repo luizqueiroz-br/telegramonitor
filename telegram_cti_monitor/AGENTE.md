@@ -2,8 +2,8 @@
 
 O agente lê os links `t.me` que o monitor já gravou em `messages.db`,
 classifica cada grupo com um modelo do [OpenRouter](https://openrouter.ai) e
-entra nos grupos classificados como fraude. Ele roda **dentro do `make run`** e
-usa a mesma sessão do Telegram do monitor.
+entra nos grupos aprovados (pelo modelo ou por você no TUI). Ele roda **dentro
+do `make run`** e usa a mesma sessão do Telegram do monitor.
 
 > Entrar em grupos é uma ação externa na sua conta. Leia os limites e riscos
 > abaixo antes de ligar o modo autônomo.
@@ -22,13 +22,26 @@ A cada varredura (padrão: 5 min):
      flags de scam/fake);
    - público: resolve o `@usuario` e confirma que é grupo;
    - já membro, canal ou entrada por aprovação são marcados como `skipped`/`already`;
-5. manda link + título + descrição + (opcional) texto da mensagem para o modelo;
-6. se `fraud = true` e `score >= AGENT_MIN_SCORE`, marca `approved`;
-7. se o modo autônomo estiver ligado e houver orçamento, entra no grupo
-   (`ImportChatInvite` ou `JoinChannel`) e marca `joined`.
+5. filtra repetidos: se o mesmo chat (pelo id) ou o mesmo título exato já está
+   `approved`/`joined`/`already`, marca `duplicate` e não gasta classificação;
+6. manda link + título + descrição + (opcional) texto da mensagem para o modelo;
+7. se `fraud = true` e `score >= AGENT_MIN_SCORE`, marca `approved`;
+8. se for entrar (`AGENT_AUTO_JOIN=true` ou aprovação manual no TUI) e houver
+   orçamento, entra (`ImportChatInvite` ou `JoinChannel`) e marca `joined`.
 
 A classificação usa `temperature = 0`, `max_tokens = 200` e no máximo
 `AGENT_CLASSIFY_PER_SCAN` links por varredura, para controlar custo.
+
+Falhas são separadas em dois grupos:
+
+- **permanentes** (convite expirado/inválido, chat privado ou apagado, grupo
+  cheio, banido, `@usuario` inexistente): o convite vira `skipped` de primeira,
+  sem gastar tentativas nem orçamento;
+- **transitórias**: voltam para a fila até 3 tentativas e depois viram `error`
+  na triagem ou `failed` na entrada.
+
+`FLOOD_WAIT` e `PEER_FLOOD` (anti-spam da conta) não marcam o convite como
+falho: pausam as entradas por até 1 h e o convite volta para `approved`.
 
 ## Configuração
 
@@ -43,15 +56,18 @@ AGENT_SEND_CONTEXT=true
 AGENT_MIN_SCORE=0.8
 ```
 
-Sem `AGENT_AUTO_JOIN=true` o agente só classifica (e deixa os aprovados na
-tabela para revisão). Esse é o modo recomendado para os primeiros dias.
+Sem `AGENT_AUTO_JOIN=true` o agente não entra nos aprovados pelo modelo. Ele
+continua entrando nos que você aprovar manualmente no TUI (tecla `y`), porque
+essa é uma decisão explícita sua. `AGENT_DRY_RUN=true` bloqueia toda entrada,
+inclusive as manuais.
 
 | Variável | Padrão | Efeito |
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | sem ela o agente não liga |
-| `OPENROUTER_MODEL` | `google/gemini-2.5-flash` | modelo do OpenRouter |
+| `OPENROUTER_MSG_MODEL` | — | modelo leve, compartilhado com a triagem de mensagens; se definido, vale para o agente também |
+| `OPENROUTER_MODEL` | `google/gemini-2.5-flash` | modelo do OpenRouter (usado quando `OPENROUTER_MSG_MODEL` não existe) |
 | `AGENT_ENABLED` | `true` | `false` desliga |
-| `AGENT_AUTO_JOIN` | `false` | `true` entra sozinho; `false` só classifica (revisão manual) |
+| `AGENT_AUTO_JOIN` | `false` | `true` entra sozinho nos aprovados pelo modelo; `false` só entra os aprovados no TUI |
 | `AGENT_DRY_RUN` | `false` | `true` nunca entra, só registra |
 | `AGENT_SEND_CONTEXT` | `true` | envia o texto da mensagem como contexto |
 | `AGENT_MIN_SCORE` | `0.8` | score mínimo para entrar |
@@ -71,9 +87,13 @@ Modelos baratos para testar: `google/gemini-2.5-flash`,
   também consome orçamento.
 - `attempted_at` fica no SQLite, então reiniciar o monitor **não** zera a
   janela de 1 h / 1 dia.
-- `FLOOD_WAIT` do Telegram interrompe as entradas da varredura e respeita o
-  tempo pedido (limitado a 1 h).
-- Há uma pausa (`AGENT_JOIN_DELAY_SECS`) entre entradas.
+- `FLOOD_WAIT` do Telegram interrompe **entradas e consultas de preview** e
+  respeita o tempo pedido (teto de 24 h). `PEER_FLOOD` para tudo por 24 h.
+- Há uma pausa (`AGENT_JOIN_DELAY_SECS`) entre entradas e 3 s entre consultas
+  de preview das triagens.
+- Fotos de remetentes/grupos são baixadas uma vez por versão, espaçadas em 2 s.
+- O teto diário (`AGENT_MAX_JOINS_PER_DAY`, padrão 6) vale até para retry
+  forçado no TUI; só o limite por hora é ignorado.
 - Os padrões (2/h, 6/dia) são conservadores, mas **não há garantia** de que a
   conta não seja limitada. Contas novas e muitos grupos por dia são o cenário
   de maior risco. Aumente só se souber o que está fazendo.
@@ -90,9 +110,37 @@ ou
 AGENT_AUTO_JOIN=false
 ```
 
+## TUI: acompanhar e decidir
+
+`make dash` → tecla `a` abre a aba **Agente**.
+
+- Lista as análises: status, score, veredito, título, link e chat de origem.
+- Por padrão **oculta** `joined`, `already` e `duplicate` (já entrou ou repetido).
+  `f` mostra tudo.
+- `Enter` abre o detalhe com o motivo do modelo, o texto de origem e o
+  histórico de ações.
+- `y` aprova e enfileira a entrada; `n` rejeita (status `skipped`);
+  `x` faz retry forçado, ignorando o orçamento por hora/dia daquele convite.
+- `r` recarrega, `s` vai para estatísticas, `a` volta para as mensagens.
+
+Aprovar no TUI **não** entra na hora: o dashboard não fala com o Telegram. A
+decisão grava `manual_approved=1` e a ação `manual_approve`; o agente do
+`make run` executa na próxima varredura, respeitando os limites de 1 h / 1 dia.
+Isso vale mesmo com `AGENT_AUTO_JOIN=false`. Com `AGENT_DRY_RUN=true` nada é
+executado até você desligar o dry-run.
+
+O `x` (retry forçado) marca `force_join=1`: o agente tenta aquele convite mesmo
+com o limite por hora esgotado. O teto diário continua valendo. Não vale para
+convites `pending` (sem triagem) nem para os já tratados
+(`joined`/`already`/`duplicate`). O flag é consumido na tentativa e não passa
+por cima de `FLOOD_WAIT`/`PEER_FLOOD` (espera mandada pelo Telegram) nem do
+dry-run.
+
 ## Tabela `group_candidates`
 
 Estados: `pending` → `approved`/`skipped` → `joined`/`already`/`failed`/`error`.
+`duplicate` é terminal (mesmo chat/título de um grupo já aprovado ou entrado).
+Aprovações manuais têm `manual_approved = 1`.
 
 Acompanhe:
 
@@ -101,16 +149,36 @@ sqlite3 messages.db "SELECT status, COUNT(*) FROM group_candidates GROUP BY stat
 sqlite3 messages.db "SELECT link, score, reason, status FROM group_candidates ORDER BY id DESC LIMIT 20;"
 ```
 
-Reprocessar erros (ex.: depois de corrigir a chave/modelo):
+Reprocessar erros de classificação (ex.: depois de corrigir a chave/modelo):
 
 ```bash
-sqlite3 messages.db "UPDATE group_candidates SET status='pending', tries=0 WHERE status IN ('error','failed');"
+sqlite3 messages.db "UPDATE group_candidates SET status='pending', tries=0, error=NULL WHERE status='error';"
 ```
 
-Forçar nova tentativa num grupo específico:
+Reenfileirar falhas de entrada como aprovação manual (consome orçamento):
 
 ```bash
-sqlite3 messages.db "UPDATE group_candidates SET status='approved', attempted_at=NULL WHERE link='https://t.me/+...';"
+sqlite3 messages.db "UPDATE group_candidates SET status='approved', manual_approved=1, tries=0, error=NULL WHERE status='failed';"
+```
+
+Forçar nova tentativa num grupo específico (sem zerar `attempted_at`, para não
+burlar o limite):
+
+```bash
+sqlite3 messages.db "UPDATE group_candidates SET status='approved', manual_approved=1, tries=0, error=NULL WHERE link='https://t.me/+...';"
+```
+
+## Log de ações (`group_actions`)
+
+Cada ação do agente e do TUI vira uma linha (`link`, `action`, `detail`,
+`actor` = `agent`/`manual`, `created_at`):
+
+- `approved`/`skipped` (detalhe traz score e motivo), `duplicate`, `already`;
+- `join_attempt`, `joined`, `failed`, `retry`, `error`;
+- `manual_approve`, `manual_skip`.
+
+```bash
+sqlite3 messages.db "SELECT created_at, actor, action, detail FROM group_actions ORDER BY id DESC LIMIT 30;"
 ```
 
 ## Privacidade e dados enviados
@@ -139,6 +207,8 @@ adicionar os ids. Para coletar de tudo que o agente entrar, deixe
 | agente ligado mas nenhum link novo | não há `t.me` em `messages`, ou o link já foi visto |
 | `FLOOD_WAIT` | Telegram pediu pausa; o agente para e tenta na próxima |
 | `limite de entradas atingido` | orçamento por hora/dia; espere a janela |
+| aprovação no TUI não entra | agente não está no `make run`, `AGENT_DRY_RUN=true`, `AGENT_ENABLED=false` ou limite atingido |
+| convite sumiu da lista do TUI | virou `joined`/`already`/`duplicate`; `f` mostra tudo |
 | grupo entrou mas nada é coletado | `MONITORED_CHATS` está preenchido sem esse id |
 
 ## Aviso

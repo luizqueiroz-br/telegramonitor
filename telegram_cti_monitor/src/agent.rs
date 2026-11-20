@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{MessageStore, env_or_dotenv};
 
-const DEFAULT_MODEL: &str = "google/gemini-2.5-flash";
-const PROMPT_TEXT_LIMIT: usize = 2000;
+pub(crate) const DEFAULT_MODEL: &str = "google/gemini-2.5-flash";
+pub(crate) const PROMPT_TEXT_LIMIT: usize = 2000;
 const MAX_TRIES: i64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,10 +75,14 @@ impl Config {
             println!("[agente] desativado (OPENROUTER_API_KEY ausente)");
             return None;
         };
+        // Mesmo modelo leve da triagem de mensagens, quando configurado.
+        let model = env_or_dotenv(file, "OPENROUTER_MSG_MODEL")
+            .or_else(|| env_or_dotenv(file, "OPENROUTER_MODEL"))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        println!("[agente] modelo={model}");
         Some(Self {
             api_key,
-            model: env_or_dotenv(file, "OPENROUTER_MODEL")
-                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            model,
             auto_join: flag(file, "AGENT_AUTO_JOIN", false),
             dry_run: flag(file, "AGENT_DRY_RUN", false),
             send_context: flag(file, "AGENT_SEND_CONTEXT", true),
@@ -137,7 +141,7 @@ async fn scan_once(
     flood_until: &mut Option<Instant>,
 ) -> Result<(), String> {
     ingest_links(store, last_seen).await?;
-    classify_pending(client, store, config).await?;
+    classify_pending(client, store, config, flood_until).await?;
     join_approved(client, store, config, flood_until).await?;
     Ok(())
 }
@@ -316,9 +320,11 @@ enum Preview {
         about: Option<String>,
         participants: Option<i32>,
         flagged: bool,
+        target_id: Option<i64>,
     },
     Already {
         title: String,
+        target_id: Option<i64>,
     },
     Skip {
         reason: String,
@@ -364,6 +370,7 @@ async fn classify_pending(
     client: &Client,
     store: &MessageStore,
     config: &Config,
+    flood_until: &mut Option<Instant>,
 ) -> Result<(), String> {
     if config.classify_per_scan == 0 {
         return Ok(());
@@ -396,26 +403,51 @@ async fn classify_pending(
         ));
     }
 
+    let mut previewed = 0u32;
     for (id, link, kind, target, source_chat, source_text) in pending {
+        if let Some(until) = *flood_until
+            && Instant::now() < until
+        {
+            return Ok(());
+        }
         let Some(kind) = Kind::from_str(&kind) else {
             mark(store, id, "error", Some("kind inválido")).await?;
+            log_action(store, &link, "error", "kind inválido", "agent").await?;
             continue;
         };
+        // Espaça as consultas ao Telegram; a classificação em si é HTTP
+        // externa, mas um OpenRouter fora do ar não pode virar rajada.
+        if previewed > 0 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        previewed += 1;
         let preview = match preview(client, kind, &target).await {
             Ok(preview) => preview,
             Err(e) => {
-                retry_or_fail(store, id, &e).await?;
+                if let Some(secs) = flood_seconds_from_text(&e) {
+                    *flood_until = Some(Instant::now() + Duration::from_secs(secs));
+                    println!("[agente] flood ao consultar {link}; pausa de {secs}s");
+                    return Ok(());
+                }
+                if preview_error_is_permanent(&e) {
+                    mark(store, id, "skipped", Some(&e)).await?;
+                    log_action(store, &link, "skipped", &e, "agent").await?;
+                } else {
+                    retry_or_fail(store, id, &link, &e).await?;
+                }
                 continue;
             }
         };
-        let (title, about, participants, flagged) = match preview {
-            Preview::Already { title } => {
+        let (title, about, participants, flagged, target_id) = match preview {
+            Preview::Already { title, target_id } => {
                 println!("[agente] já é membro: {title} ({link})");
-                mark_already(store, id, &title).await?;
+                mark_already(store, id, &title, target_id).await?;
+                log_action(store, &link, "already", "", "agent").await?;
                 continue;
             }
             Preview::Skip { reason } => {
                 mark(store, id, "skipped", Some(&reason)).await?;
+                log_action(store, &link, "skipped", &reason, "agent").await?;
                 continue;
             }
             Preview::Group {
@@ -423,8 +455,16 @@ async fn classify_pending(
                 about,
                 participants,
                 flagged,
-            } => (title, about, participants, flagged),
+                target_id,
+            } => (title, about, participants, flagged, target_id),
         };
+
+        if let Some(reason) = duplicate_of(store, target_id, Some(&title), id, true).await? {
+            println!("[agente] repetido: {link} ({reason})");
+            mark(store, id, "duplicate", Some(&reason)).await?;
+            log_action(store, &link, "duplicate", &reason, "agent").await?;
+            continue;
+        }
 
         match classify(
             config,
@@ -441,14 +481,16 @@ async fn classify_pending(
             Ok(verdict) => {
                 let fraud = verdict.fraud && verdict.score >= config.min_score;
                 let status = if fraud { "approved" } else { "skipped" };
-                store
+                let changed = store
                     .conn
                     .execute(
-                        "UPDATE group_candidates SET status = ?, target_title = ?, target_about = ?,
+                        "UPDATE group_candidates SET
+                            status = CASE WHEN manual_approved = 1 THEN 'approved' ELSE ? END,
+                            target_title = ?, target_about = ?,
                             target_kind = 'group', participants = ?, flagged = ?, score = ?,
                             verdict = ?, reason = ?, model = ?, checked_at = CURRENT_TIMESTAMP,
-                            tries = 0, error = NULL
-                         WHERE id = ?",
+                            tries = 0, error = NULL, target_id = COALESCE(?, target_id)
+                         WHERE id = ? AND (status = 'pending' OR manual_approved = 1)",
                         libsql::params![
                             status,
                             title,
@@ -459,11 +501,20 @@ async fn classify_pending(
                             if verdict.fraud { "fraud" } else { "benign" },
                             verdict.reason.clone(),
                             config.model.clone(),
+                            target_id,
                             id
                         ],
                     )
                     .await
                     .map_err(|e| format!("Falha ao salvar veredito: {e}"))?;
+                if changed == 0 {
+                    // Decisão manual chegou durante a classificação; ela vence.
+                    println!("[agente] veredito descartado (ação manual): {link}");
+                    continue;
+                }
+                let action = if fraud { "approved" } else { "skipped" };
+                let detail = format!("score={:.2}: {}", verdict.score, verdict.reason);
+                log_action(store, &link, action, &detail, "agent").await?;
                 if fraud {
                     println!(
                         "[agente] FRAUDE score={:.2} {} ({})",
@@ -471,7 +522,7 @@ async fn classify_pending(
                     );
                 }
             }
-            Err(e) => retry_or_fail(store, id, &e).await?,
+            Err(e) => retry_or_fail(store, id, &link, &e).await?,
         }
     }
     Ok(())
@@ -503,23 +554,27 @@ async fn preview(client: &Client, kind: Kind, target: &str) -> Result<Preview, S
                         about: info.about,
                         participants: Some(info.participants_count),
                         flagged: info.scam || info.fake,
+                        target_id: None,
                     })
                 }
                 grammers_client::tl::enums::ChatInvite::Already(already) => {
                     let peer = Peer::from_raw(client, already.chat);
                     Ok(Preview::Already {
                         title: peer.name().unwrap_or("(sem nome)").to_string(),
+                        target_id: peer.id().bot_api_dialog_id(),
                     })
                 }
                 grammers_client::tl::enums::ChatInvite::Peek(peek) => {
                     let peer = Peer::from_raw(client, peek.chat);
                     let title = peer.name().unwrap_or("(sem nome)").to_string();
+                    let target_id = peer.id().bot_api_dialog_id();
                     match peer {
                         Peer::Group(_) => Ok(Preview::Group {
                             title,
                             about: None,
                             participants: None,
                             flagged: false,
+                            target_id,
                         }),
                         _ => Ok(Preview::Skip {
                             reason: "não é grupo".to_string(),
@@ -535,12 +590,14 @@ async fn preview(client: &Client, kind: Kind, target: &str) -> Result<Preview, S
                 .map_err(|e| format!("resolve @{target}: {e}"))?
                 .ok_or_else(|| format!("@{target} não encontrado"))?;
             let title = peer.name().unwrap_or("(sem nome)").to_string();
+            let target_id = peer.id().bot_api_dialog_id();
             match peer {
                 Peer::Group(_) => Ok(Preview::Group {
                     title,
                     about: None,
                     participants: None,
                     flagged: false,
+                    target_id,
                 }),
                 _ => Ok(Preview::Skip {
                     reason: "canal/usuário, não grupo".to_string(),
@@ -608,19 +665,24 @@ async fn classify(
     .map_err(|e| format!("Falha ao montar requisição: {e}"))?;
 
     let key = config.api_key.clone();
-    let content = tokio::task::spawn_blocking(move || curl_openrouter(&key, &body))
+    let content = tokio::task::spawn_blocking(move || curl_openrouter(&key, &body, 60))
         .await
         .map_err(|e| format!("Falha na thread do curl: {e}"))??;
     parse_verdict(&content)
 }
 
-fn curl_openrouter(api_key: &str, body: &str) -> Result<String, String> {
+pub(crate) fn curl_openrouter(
+    api_key: &str,
+    body: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
     // shortcut: a chave vai no argv do curl; use um config file se a máquina for multiusuário.
+    let timeout = timeout_secs.to_string();
     let mut child = Command::new("curl")
         .args([
             "-sS",
             "-m",
-            "60",
+            timeout.as_str(),
             "-X",
             "POST",
             "https://openrouter.ai/api/v1/chat/completions",
@@ -709,7 +771,10 @@ fn parse_verdict(content: &str) -> Result<Verdict, String> {
 // ============================================================
 
 enum JoinOutcome {
-    Joined(String),
+    Joined {
+        title: String,
+        target_id: Option<i64>,
+    },
     Already,
     Skipped(String),
     FloodWait(u64),
@@ -722,7 +787,7 @@ async fn join_approved(
     config: &Config,
     flood_until: &mut Option<Instant>,
 ) -> Result<(), String> {
-    if !config.auto_join || config.dry_run {
+    if config.dry_run {
         return Ok(());
     }
     if let Some(until) = *flood_until
@@ -731,11 +796,14 @@ async fn join_approved(
         return Ok(());
     }
 
+    let filter = approved_filter(config.auto_join);
     let mut rows = store
         .conn
         .query(
-            "SELECT id, link, kind, target FROM group_candidates
-             WHERE status = 'approved' ORDER BY id",
+            &format!(
+                "SELECT id, link, kind, target, COALESCE(force_join, 0)
+                 FROM group_candidates WHERE {filter} ORDER BY id"
+            ),
             (),
         )
         .await
@@ -751,63 +819,110 @@ async fn join_approved(
             row.get::<String>(1).unwrap_or_default(),
             row.get::<String>(2).unwrap_or_default(),
             row.get::<String>(3).unwrap_or_default(),
+            row.get::<i64>(4).unwrap_or(0) != 0,
         ));
     }
 
-    for (id, link, kind, target) in approved {
+    let mut budget_hit = false;
+    for (id, link, kind, target, force) in approved {
         if let Some(until) = *flood_until
             && Instant::now() < until
         {
             break;
         }
         let (hour, day) = attempt_counts(store).await?;
-        if hour >= config.max_per_hour as i64 || day >= config.max_per_day as i64 {
-            println!("[agente] limite de entradas atingido ({hour}/h, {day}/dia); aguardando");
-            break;
+        let day_full = day >= config.max_per_day as i64;
+        // Retry forçado no TUI ignora só o limite por hora. O teto diário é
+        // duro: passá-lo é o caminho mais curto para PEER_FLOOD/ban.
+        if day_full || (!force && hour >= config.max_per_hour as i64) {
+            if !budget_hit {
+                println!("[agente] limite de entradas atingido ({hour}/h, {day}/dia); aguardando");
+                budget_hit = true;
+            }
+            if day_full {
+                break;
+            }
+            continue;
         }
         let Some(kind) = Kind::from_str(&kind) else {
             mark(store, id, "error", Some("kind inválido")).await?;
+            log_action(store, &link, "error", "kind inválido", "agent").await?;
             continue;
         };
 
         // Reconfere antes de gastar tentativa: já membro/canal não devem contar.
-        match preview(client, kind, &target).await {
-            Ok(Preview::Already { title }) => {
-                mark_already(store, id, &title).await?;
+        let (title, target_id) = match preview(client, kind, &target).await {
+            Ok(Preview::Already { title, target_id }) => {
+                mark_already(store, id, &title, target_id).await?;
+                log_action(store, &link, "already", "", "agent").await?;
                 println!("[agente] já é membro: {title}");
                 continue;
             }
             Ok(Preview::Skip { reason }) => {
                 mark(store, id, "skipped", Some(&reason)).await?;
+                log_action(store, &link, "skipped", &reason, "agent").await?;
                 continue;
             }
-            Ok(Preview::Group { .. }) => {}
+            Ok(Preview::Group {
+                title, target_id, ..
+            }) => (title, target_id),
             Err(e) => {
-                retry_join(store, id, &e).await?;
+                if let Some(secs) = flood_seconds_from_text(&e) {
+                    *flood_until = Some(Instant::now() + Duration::from_secs(secs));
+                    println!("[agente] flood ao conferir {link}; pausa de {secs}s");
+                    break;
+                }
+                if preview_error_is_permanent(&e) {
+                    mark(store, id, "skipped", Some(&e)).await?;
+                    log_action(store, &link, "skipped", &e, "agent").await?;
+                } else {
+                    retry_join(store, id, &link, &e).await?;
+                }
                 continue;
             }
+        };
+
+        if let Some(reason) =
+            duplicate_of(store, target_id, Some(&title), id, config.auto_join).await?
+        {
+            println!("[agente] repetido: {link} ({reason})");
+            mark(store, id, "duplicate", Some(&reason)).await?;
+            log_action(store, &link, "duplicate", &reason, "agent").await?;
+            continue;
         }
 
-        store
+        let marked = store
             .conn
             .execute(
-                "UPDATE group_candidates SET attempted_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE group_candidates SET attempted_at = CURRENT_TIMESTAMP,
+                    force_join = 0 WHERE id = ? AND status = 'approved'",
                 libsql::params![id],
             )
             .await
             .map_err(|e| format!("Falha ao marcar tentativa: {e}"))?;
+        if marked == 0 {
+            // Decisão manual (rejeição) em outro processo durante a varredura.
+            continue;
+        }
+        log_action(store, &link, "join_attempt", "", "agent").await?;
 
         match join_target(client, kind, &target).await {
-            JoinOutcome::Joined(title) => {
+            JoinOutcome::Joined {
+                title,
+                target_id: joined_id,
+            } => {
                 store
                     .conn
                     .execute(
                         "UPDATE group_candidates SET status = 'joined',
-                            joined_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?",
-                        libsql::params![id],
+                            joined_at = CURRENT_TIMESTAMP, error = NULL, tries = 0,
+                            target_id = COALESCE(?, target_id)
+                         WHERE id = ?",
+                        libsql::params![joined_id, id],
                     )
                     .await
                     .map_err(|e| format!("Falha ao salvar entrada: {e}"))?;
+                log_action(store, &link, "joined", &title, "agent").await?;
                 println!("[agente] entrou no grupo: {title} ({link})");
             }
             JoinOutcome::Already => {
@@ -815,24 +930,39 @@ async fn join_approved(
                     .conn
                     .execute(
                         "UPDATE group_candidates SET status = 'already',
-                            attempted_at = NULL, joined_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            attempted_at = NULL, joined_at = CURRENT_TIMESTAMP, tries = 0
+                         WHERE id = ?",
                         libsql::params![id],
                     )
                     .await
                     .map_err(|e| format!("Falha ao salvar entrada: {e}"))?;
+                log_action(store, &link, "already", "", "agent").await?;
                 println!("[agente] já era membro: {link}");
             }
             JoinOutcome::Skipped(reason) => {
                 mark(store, id, "skipped", Some(&reason)).await?;
+                log_action(store, &link, "skipped", &reason, "agent").await?;
             }
             JoinOutcome::FloodWait(seconds) => {
-                *flood_until = Some(Instant::now() + Duration::from_secs(seconds.min(3600)));
-                mark(store, id, "failed", Some("FLOOD_WAIT")).await?;
+                // Flood é da conta, não do convite: o link volta para a fila
+                // (não vira `failed`) e a próxima tentativa espera a pausa.
+                *flood_until = Some(Instant::now() + Duration::from_secs(seconds.min(86_400)));
+                store
+                    .conn
+                    .execute(
+                        "UPDATE group_candidates SET status = 'approved', error = ?,
+                            attempted_at = NULL WHERE id = ?",
+                        libsql::params![format!("FLOOD_WAIT {seconds}s"), id],
+                    )
+                    .await
+                    .map_err(|e| format!("Falha ao salvar flood: {e}"))?;
+                let detail = format!("FLOOD_WAIT {seconds}s");
+                log_action(store, &link, "flood_wait", &detail, "agent").await?;
                 eprintln!("[agente] FLOOD_WAIT de {seconds}s; parando entradas por agora");
                 break;
             }
             JoinOutcome::Failed(e) => {
-                mark(store, id, "failed", Some(&e)).await?;
+                retry_join(store, id, &link, &e).await?;
                 eprintln!("[agente] falha ao entrar em {link}: {e}");
             }
         }
@@ -841,14 +971,24 @@ async fn join_approved(
     Ok(())
 }
 
+/// Com `AGENT_AUTO_JOIN=false`, só entram os aprovados manualmente no TUI.
+fn approved_filter(auto_join: bool) -> &'static str {
+    if auto_join {
+        "status = 'approved'"
+    } else {
+        "status = 'approved' AND (manual_approved = 1 OR force_join = 1)"
+    }
+}
+
 async fn join_target(client: &Client, kind: Kind, target: &str) -> JoinOutcome {
     match kind {
         Kind::Invite => {
             let link = format!("https://t.me/+{target}");
             match client.accept_invite_link(&link).await {
-                Ok(Some(peer)) => {
-                    JoinOutcome::Joined(peer.name().unwrap_or("(sem nome)").to_string())
-                }
+                Ok(Some(peer)) => JoinOutcome::Joined {
+                    title: peer.name().unwrap_or("(sem nome)").to_string(),
+                    target_id: peer.id().bot_api_dialog_id(),
+                },
                 Ok(None) => JoinOutcome::Failed("Telegram não retornou o chat".to_string()),
                 Err(e) => describe_error(e),
             }
@@ -860,36 +1000,88 @@ async fn join_target(client: &Client, kind: Kind, target: &str) -> JoinOutcome {
                 Err(e) => return describe_error(e),
             };
             let title = peer.name().unwrap_or("(sem nome)").to_string();
+            let target_id = peer.id().bot_api_dialog_id();
             let peer_ref = match peer.to_ref().await {
                 Ok(Some(peer_ref)) => peer_ref,
                 Ok(None) => return JoinOutcome::Failed("peer sem referência".to_string()),
                 Err(e) => return JoinOutcome::Failed(e.to_string()),
             };
             match client.join_chat(peer_ref).await {
-                Ok(_) => JoinOutcome::Joined(title),
+                Ok(_) => JoinOutcome::Joined { title, target_id },
                 Err(e) => describe_error(e),
             }
         }
     }
 }
 
+/// Erros que nunca vão passar tentando de novo (link morto, chat privado,
+/// grupo cheio, banido). Tentar 3× só gasta orçamento e termina em `failed`.
+const PERMANENT_RPC: &[&str] = &[
+    "INVITE_HASH_EXPIRED",
+    "INVITE_HASH_INVALID",
+    "CHANNEL_PRIVATE",
+    "CHANNEL_INVALID",
+    "CHAT_FORBIDDEN",
+    "USER_BANNED_IN_CHANNEL",
+    "USERS_TOO_MUCH",
+    "USER_CHANNELS_TOO_MUCH",
+    "CHANNELS_TOO_MUCH",
+    "INVITE_REQUEST_SENT",
+    "USERNAME_NOT_OCCUPIED",
+    "USERNAME_INVALID",
+    "PEER_ID_INVALID",
+];
+
+fn rpc_name(error: &InvocationError) -> Option<&str> {
+    match error {
+        InvocationError::Rpc(rpc) => Some(rpc.name.as_str()),
+        _ => None,
+    }
+}
+
+/// `preview()` devolve texto; basta reconhecer o nome do RPC no meio.
+fn preview_error_is_permanent(message: &str) -> bool {
+    PERMANENT_RPC.iter().any(|name| message.contains(*name))
+}
+
+/// Pausa pedida pelo Telegram dentro de um erro textualizado do preview.
+/// Sem número legível assume 1 h; PEER_FLOOD vale 24 h. Teto de 24 h porque
+/// retentar antes do prazo é o que transforma flood em restrição.
+fn flood_seconds_from_text(message: &str) -> Option<u64> {
+    if message.contains("PEER_FLOOD") {
+        return Some(86_400);
+    }
+    let start = message.find("FLOOD_WAIT")? + "FLOOD_WAIT".len();
+    let digits: String = message[start..]
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    Some(digits.parse().ok().filter(|secs| *secs > 0).unwrap_or(3600).min(86_400))
+}
+
 fn describe_error(error: InvocationError) -> JoinOutcome {
-    if let InvocationError::Rpc(rpc) = &error {
-        if rpc.name == "FLOOD_WAIT" {
-            return JoinOutcome::FloodWait(rpc.value.unwrap_or(60) as u64);
+    if let Some(name) = rpc_name(&error) {
+        if name == "FLOOD_WAIT" {
+            let seconds = match &error {
+                InvocationError::Rpc(rpc) => rpc.value.unwrap_or(60) as u64,
+                _ => 60,
+            };
+            return JoinOutcome::FloodWait(seconds);
         }
-        if rpc.name == "USER_ALREADY_PARTICIPANT" {
+        if name == "PEER_FLOOD" {
+            // Anti-spam da conta: 24 h paradas, sem culpar o convite.
+            return JoinOutcome::FloodWait(86_400);
+        }
+        if name == "USER_ALREADY_PARTICIPANT" {
             return JoinOutcome::Already;
         }
-        if matches!(
-            rpc.name.as_str(),
-            "INVITE_REQUEST_SENT" | "CHANNELS_TOO_MUCH" | "INVITE_HASH_EXPIRED"
-        ) {
-            return JoinOutcome::Skipped(format!(
-                "{} {}",
-                rpc.name,
-                rpc.value.map(|v| v.to_string()).unwrap_or_default()
-            ));
+        if PERMANENT_RPC.contains(&name) {
+            let value = match &error {
+                InvocationError::Rpc(rpc) => rpc.value.map(|v| v.to_string()).unwrap_or_default(),
+                _ => String::new(),
+            };
+            return JoinOutcome::Skipped(format!("{name} {value}").trim_end().to_string());
         }
     }
     JoinOutcome::Failed(error.to_string())
@@ -924,8 +1116,8 @@ async fn mark(
     store
         .conn
         .execute(
-            "UPDATE group_candidates SET status = ?, error = ?, checked_at = CURRENT_TIMESTAMP
-             WHERE id = ?",
+            "UPDATE group_candidates SET status = ?, error = ?, force_join = 0,
+                checked_at = CURRENT_TIMESTAMP WHERE id = ?",
             libsql::params![status, error, id],
         )
         .await
@@ -933,50 +1125,190 @@ async fn mark(
     Ok(())
 }
 
-async fn mark_already(store: &MessageStore, id: i64, title: &str) -> Result<(), String> {
+async fn mark_already(
+    store: &MessageStore,
+    id: i64,
+    title: &str,
+    target_id: Option<i64>,
+) -> Result<(), String> {
     store
         .conn
         .execute(
             "UPDATE group_candidates SET status = 'already', target_title = ?,
-                target_kind = 'group', joined_at = CURRENT_TIMESTAMP, error = NULL
+                target_kind = 'group', joined_at = CURRENT_TIMESTAMP, error = NULL,
+                tries = 0, force_join = 0, target_id = COALESCE(?, target_id)
              WHERE id = ?",
-            libsql::params![title, id],
+            libsql::params![title, target_id, id],
         )
         .await
         .map_err(|e| format!("Falha ao atualizar candidato: {e}"))?;
     Ok(())
 }
 
+/// Um grupo já aprovado (quando auto-join) ou já entrado não deve ser contado
+/// de novo. Casa pelo id do chat; senão por título exato (>= 6 chars).
+async fn duplicate_of(
+    store: &MessageStore,
+    target_id: Option<i64>,
+    target_title: Option<&str>,
+    current_id: i64,
+    include_approved: bool,
+) -> Result<Option<String>, String> {
+    // Sem auto-join, `approved` do modelo não é joinável; a entrada manual
+    // resolve o repetido pelo preview (`Already`).
+    let statuses = if include_approved {
+        "status IN ('approved','joined','already')"
+    } else {
+        "status IN ('joined','already')"
+    };
+    if let Some(target_id) = target_id.filter(|id| *id != 0) {
+        let mut rows = store
+            .conn
+            .query(
+                &format!(
+                    "SELECT link FROM group_candidates
+                     WHERE target_id = ? AND id <> ? AND {statuses}
+                     LIMIT 1"
+                ),
+                libsql::params![target_id, current_id],
+            )
+            .await
+            .map_err(|e| format!("Falha ao procurar repetido: {e}"))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("Falha ao procurar repetido: {e}"))?
+        {
+            let link: String = row.get(0).unwrap_or_default();
+            return Ok(Some(format!("mesmo grupo de {link}")));
+        }
+    }
+
+    if let Some(title) = target_title {
+        // Comparado em Rust: o `lower()` do SQLite só dobra ASCII, então títulos
+        // com acento maiúsculo ("AÇÃO" x "ação") escapariam do dedupe.
+        // shortcut: varre os candidatos em memória; migrar para coluna
+        // normalizada se a tabela passar de alguns milhares de linhas.
+        let normalized = title.trim().to_lowercase();
+        if normalized.chars().count() >= 6 {
+            let mut rows = store
+                .conn
+                .query(
+                    &format!(
+                        "SELECT link, COALESCE(target_title, '') FROM group_candidates
+                         WHERE id <> ? AND {statuses}"
+                    ),
+                    libsql::params![current_id],
+                )
+                .await
+                .map_err(|e| format!("Falha ao procurar repetido: {e}"))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| format!("Falha ao procurar repetido: {e}"))?
+            {
+                let other: String = row.get(1).unwrap_or_default();
+                if other.trim().to_lowercase() == normalized {
+                    let link: String = row.get(0).unwrap_or_default();
+                    return Ok(Some(format!("mesmo título de {link}")));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Registra uma ação do agente (ou manual do TUI) para auditoria e histórico.
+pub(crate) async fn log_action(
+    store: &MessageStore,
+    link: &str,
+    action: &str,
+    detail: &str,
+    actor: &str,
+) -> Result<(), String> {
+    store
+        .conn
+        .execute(
+            "INSERT INTO group_actions (link, action, detail, actor) VALUES (?, ?, ?, ?)",
+            libsql::params![link, action, detail, actor],
+        )
+        .await
+        .map_err(|e| format!("Falha ao registrar ação: {e}"))?;
+    Ok(())
+}
+
+async fn status_of(store: &MessageStore, id: i64) -> Result<String, String> {
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT status FROM group_candidates WHERE id = ?",
+            libsql::params![id],
+        )
+        .await
+        .map_err(|e| format!("Falha ao ler candidato: {e}"))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|e| format!("Falha ao ler candidato: {e}"))?
+        .map(|row| row.get::<String>(0).unwrap_or_default())
+        .unwrap_or_default())
+}
+
 /// Erro transitório no preview de um aprovado: mantém `approved` para tentar
 /// de novo sem pagar outra classificação; após [`MAX_TRIES`] vira `failed`.
-async fn retry_join(store: &MessageStore, id: i64, error: &str) -> Result<(), String> {
-    store
+async fn retry_join(store: &MessageStore, id: i64, link: &str, error: &str) -> Result<(), String> {
+    let changed = store
         .conn
         .execute(
             "UPDATE group_candidates
              SET tries = tries + 1, error = ?,
                  status = CASE WHEN tries + 1 >= ? THEN 'failed' ELSE 'approved' END
-             WHERE id = ?",
+             WHERE id = ? AND status = 'approved'",
             libsql::params![error, MAX_TRIES, id],
         )
         .await
         .map_err(|e| format!("Falha ao atualizar candidato: {e}"))?;
+    if changed == 0 {
+        // Status mudou no TUI durante a tentativa; não ressuscita a linha.
+        return Ok(());
+    }
+    let action = if status_of(store, id).await? == "failed" {
+        "failed"
+    } else {
+        "retry"
+    };
+    log_action(store, link, action, error, "agent").await?;
     Ok(())
 }
 
 /// Erros transitórios voltam para `pending` até [`MAX_TRIES`]; depois viram `error`.
-async fn retry_or_fail(store: &MessageStore, id: i64, error: &str) -> Result<(), String> {
-    store
+async fn retry_or_fail(
+    store: &MessageStore,
+    id: i64,
+    link: &str,
+    error: &str,
+) -> Result<(), String> {
+    let changed = store
         .conn
         .execute(
             "UPDATE group_candidates
              SET tries = tries + 1, error = ?, checked_at = CURRENT_TIMESTAMP,
                  status = CASE WHEN tries + 1 >= ? THEN 'error' ELSE 'pending' END
-             WHERE id = ?",
+             WHERE id = ? AND status = 'pending'",
             libsql::params![error, MAX_TRIES, id],
         )
         .await
         .map_err(|e| format!("Falha ao atualizar candidato: {e}"))?;
+    if changed == 0 {
+        // O TUI decidiu (aprovou/rejeitou) durante a classificação; preserva.
+        return Ok(());
+    }
+    let action = if status_of(store, id).await? == "error" {
+        "error"
+    } else {
+        "retry"
+    };
+    log_action(store, link, action, error, "agent").await?;
     Ok(())
 }
 
@@ -1142,5 +1474,160 @@ mod tests {
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(count, 1);
         cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn dedupe_por_chat_e_por_titulo() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO group_candidates
+                    (link, kind, target, status, target_title, target_id)
+                 VALUES ('https://t.me/+joined1', 'invite', 'joined1', 'joined',
+                         'Grupo Fraudulento', 777)",
+                (),
+            )
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO group_candidates
+                    (link, kind, target, status, target_title, target_id)
+                 VALUES ('https://t.me/+aprovado1', 'invite', 'aprovado1', 'approved',
+                         'Outro Grupo', 888)",
+                (),
+            )
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO group_candidates (link, kind, target)
+                 VALUES ('https://t.me/+outro1', 'invite', 'outro1')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let dup = duplicate_of(&store, Some(777), None, 3, true)
+            .await
+            .unwrap();
+        assert!(dup.unwrap().contains("mesmo grupo"));
+        let dup = duplicate_of(&store, Some(888), None, 3, true)
+            .await
+            .unwrap();
+        assert!(dup.unwrap().contains("mesmo grupo"));
+
+        let dup = duplicate_of(&store, None, Some("Grupo Fraudulento"), 3, true)
+            .await
+            .unwrap();
+        assert!(dup.unwrap().contains("mesmo título"));
+
+        // Sem auto-join, `approved` não joinável não conta como repetido.
+        let dup = duplicate_of(&store, Some(888), None, 3, false)
+            .await
+            .unwrap();
+        assert!(dup.is_none());
+
+        // Título curto é ambíguo demais para servir de dedupe.
+        assert!(
+            duplicate_of(&store, None, Some("VIP"), 3, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // O próprio registro não conta como repetido.
+        assert!(
+            duplicate_of(&store, Some(777), Some("Grupo Fraudulento"), 1, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn filtro_de_entrada_inclui_retry_forcado() {
+        assert!(approved_filter(false).contains("force_join"));
+        assert_eq!(approved_filter(true), "status = 'approved'");
+    }
+
+    #[tokio::test]
+    async fn dedupe_ignora_caixa_acentuada() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO group_candidates
+                    (link, kind, target, status, target_title)
+                 VALUES ('https://t.me/+acento', 'invite', 'acento', 'joined', 'REDE AÇÃO')",
+                (),
+            )
+            .await
+            .unwrap();
+        let dup = duplicate_of(&store, None, Some("rede ação"), 99, true)
+            .await
+            .unwrap();
+        assert!(dup.unwrap().contains("mesmo título"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn pausa_de_flood_respeita_o_texto() {
+        assert_eq!(
+            flood_seconds_from_text("CheckChatInvite: RPC error 420: FLOOD_WAIT (120)"),
+            Some(120)
+        );
+        assert_eq!(flood_seconds_from_text("RPC error: PEER_FLOOD"), Some(86_400));
+        assert_eq!(
+            flood_seconds_from_text("CheckChatInvite: FLOOD_WAIT"),
+            Some(3600)
+        );
+        assert_eq!(
+            flood_seconds_from_text("CheckChatInvite: FLOOD_WAIT (999999)"),
+            Some(86_400)
+        );
+        assert_eq!(flood_seconds_from_text("CheckChatInvite: timeout"), None);
+    }
+
+    #[test]
+    fn erros_permanentes_nao_repetem() {
+        assert!(preview_error_is_permanent(
+            "CheckChatInvite: RPC error: INVITE_HASH_INVALID"
+        ));
+        assert!(preview_error_is_permanent("resolve @x: USERNAME_NOT_OCCUPIED"));
+        assert!(!preview_error_is_permanent("CheckChatInvite: timeout"));
+        assert!(!preview_error_is_permanent("CheckChatInvite: FLOOD_WAIT 60"));
+    }
+
+    #[tokio::test]
+    async fn registra_acao_do_agente() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        log_action(&store, "https://t.me/+x", "approved", "score=0.9", "agent")
+            .await
+            .unwrap();
+        let mut rows = store
+            .conn
+            .query("SELECT action, actor FROM group_actions", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "approved");
+        assert_eq!(row.get::<String>(1).unwrap(), "agent");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn auto_join_desligado_so_entra_aprovado_manual() {
+        assert_eq!(
+            approved_filter(false),
+            "status = 'approved' AND (manual_approved = 1 OR force_join = 1)"
+        );
+        assert_eq!(approved_filter(true), "status = 'approved'");
     }
 }
