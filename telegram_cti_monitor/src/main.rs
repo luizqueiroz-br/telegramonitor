@@ -1093,6 +1093,19 @@ async fn send_to_cti_api(cti_url: &str, msg: &MonitoredMessage) -> Result<(), St
 /// Devolve `"ad"` ou `"chat"`. O texto é dado não confiável: o prompt proíbe
 /// seguir instruções embutidas nele.
 async fn classify_message(classifier: &MsgClassifier, text: &str) -> Result<&'static str, String> {
+    // Modelos de decisions (typesafe/jev) usam outro endpoint e outro formato.
+    if agent::decisions_model(&classifier.model) {
+        let text = text
+            .chars()
+            .take(agent::PROMPT_TEXT_LIMIT)
+            .collect::<String>();
+        let body = agent::decisions_kind_body(&classifier.model, &text);
+        let key = classifier.api_key.clone();
+        let answers = tokio::task::spawn_blocking(move || agent::curl_decisions(&key, &body, 20))
+            .await
+            .map_err(|e| format!("Falha na thread do curl: {e}"))??;
+        return parse_decisions_kind(&answers);
+    }
     let system = "You classify Telegram messages. Answer \"ad\" for advertising: \
         sales, promotions, spam, recruiting, affiliate/referral pushes, mass marketing \
         or offers with links. Answer \"chat\" for conversation: people talking, \
@@ -1106,7 +1119,8 @@ async fn classify_message(classifier: &MsgClassifier, text: &str) -> Result<&'st
     let body = serde_json::json!({
         "model": &classifier.model,
         "temperature": 0.0,
-        "max_tokens": 20,
+        // Folga para modelos que gastam tokens "pensando" antes do JSON.
+        "max_tokens": 100,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -1128,17 +1142,44 @@ fn parse_msg_kind(content: &str) -> Result<&'static str, String> {
         (Some(start), Some(end)) if end >= start => &trimmed[start..=end],
         _ => trimmed,
     };
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("JSON inválido do modelo: {e}"))?;
-    match value
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+        let kind = value
+            .get("kind")
+            .or_else(|| value.get("classification"))
+            .or_else(|| value.get("label"))
+            .and_then(|v| v.as_str());
+        if let Some(kind) = kind {
+            return kind_from_word(kind).ok_or_else(|| {
+                format!("classificação inesperada do modelo: {kind:?}")
+            });
+        }
+    }
+    // Modelo que ignora o JSON: aceita a primeira palavra da resposta ("ad", "Chat.").
+    if let Some(word) = trimmed.split(|c: char| !c.is_alphanumeric()).find(|w| !w.is_empty())
+        && let Some(kind) = kind_from_word(word)
     {
-        Some("ad" | "anúncio" | "anuncio" | "advertisement") => Ok("ad"),
-        Some("chat" | "conversa" | "conversation") => Ok("chat"),
-        other => Err(format!("classificação inesperada do modelo: {other:?}")),
+        return Ok(kind);
+    }
+    Err(format!(
+        "resposta do modelo não reconhecida: {}",
+        trimmed.chars().take(80).collect::<String>()
+    ))
+}
+
+fn parse_decisions_kind(answers: &serde_json::Value) -> Result<&'static str, String> {
+    let choice = answers
+        .pointer("/kind/choice")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("resposta do modelo sem choice: {answers}"))?;
+    kind_from_word(choice)
+        .ok_or_else(|| format!("classificação inesperada do modelo: {choice:?}"))
+}
+
+fn kind_from_word(word: &str) -> Option<&'static str> {
+    match word.trim().to_lowercase().as_str() {
+        "ad" | "ads" | "anúncio" | "anuncio" | "advertisement" => Some("ad"),
+        "chat" | "conversa" | "conversation" => Some("chat"),
+        _ => None,
     }
 }
 
@@ -1553,8 +1594,24 @@ mod tests {
         assert_eq!(parse_msg_kind(r#"{"kind":"ad"}"#).unwrap(), "ad");
         assert_eq!(parse_msg_kind(" Claro! ```json\n{\"kind\": \"chat\"}\n```").unwrap(), "chat");
         assert_eq!(parse_msg_kind(r#"{"kind":"Anúncio"}"#).unwrap(), "ad");
+        assert_eq!(parse_msg_kind(r#"{"classification":"chat"}"#).unwrap(), "chat");
+        // Modelos que respondem sem JSON (ex.: jev) também são aceitos.
+        assert_eq!(parse_msg_kind("ad").unwrap(), "ad");
+        assert_eq!(parse_msg_kind("Chat.").unwrap(), "chat");
+        assert_eq!(parse_msg_kind("  anúncio ").unwrap(), "ad");
         assert!(parse_msg_kind(r#"{"kind":"talvez"}"#).is_err());
         assert!(parse_msg_kind("sem json").is_err());
+    }
+
+    #[test]
+    fn triagem_aceita_resposta_do_decisions() {
+        use super::parse_decisions_kind;
+        let answers = serde_json::json!({
+            "kind": {"type":"choice","choice":"ad","probabilities":{"ad":1,"chat":0}}
+        });
+        assert_eq!(parse_decisions_kind(&answers).unwrap(), "ad");
+        assert!(parse_decisions_kind(&serde_json::json!({})).is_err());
+        assert!(parse_decisions_kind(&serde_json::json!({"kind":{"choice":"talvez"}})).is_err());
     }
 
     fn temp_db() -> String {

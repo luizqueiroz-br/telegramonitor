@@ -64,7 +64,7 @@ inclusive as manuais.
 | Variável | Padrão | Efeito |
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | sem ela o agente não liga |
-| `OPENROUTER_MSG_MODEL` | — | modelo leve, compartilhado com a triagem de mensagens; se definido, vale para o agente também |
+| `OPENROUTER_MSG_MODEL` | — | modelo leve, compartilhado com a triagem de mensagens; se definido, vale para o agente também. Modelos `typesafe/jev-*` são detectados e usados via `/api/alpha/decisions` |
 | `OPENROUTER_MODEL` | `google/gemini-2.5-flash` | modelo do OpenRouter (usado quando `OPENROUTER_MSG_MODEL` não existe) |
 | `AGENT_ENABLED` | `true` | `false` desliga |
 | `AGENT_AUTO_JOIN` | `false` | `true` entra sozinho nos aprovados pelo modelo; `false` só entra os aprovados no TUI |

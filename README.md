@@ -81,7 +81,9 @@ falhar, a mensagem é enviada normalmente.
 | `MSG_CLASSIFY` | `false` desliga a triagem |
 
 Escolha o modelo em <https://openrouter.ai/pt-BR/rankings/decisions>. O mesmo
-modelo leve também decide se o agente entra nos grupos. A triagem roda antes
+modelo leve também decide se o agente entra nos grupos. Modelos de *decisions*
+(os `typesafe/jev-*`) são detectados automaticamente e chamados no endpoint
+`/api/alpha/decisions`, com `choice` + `probabilities`. A triagem roda antes
 do envio, com timeout de 20 s por mensagem.
 
 Filtros (combináveis com a janela): `/` busca textual (Enter aplica, Esc
@@ -144,7 +146,8 @@ catalogados **sem chamada extra** nas tabelas `users` e `chats` do mesmo
 As fotos de perfil são baixadas **uma única vez por entidade** e ficam no
 próprio banco, como BLOB, em `users.avatar_blob` e `chats.avatar_blob`
 (assim `messages-export.db` já leva as imagens). Fotos antigas em `avatars/`
-são migradas automaticamente na primeira abertura do banco.
+são migradas automaticamente na primeira abertura do banco. No dashboard, o
+detalhe da mensagem desenha o avatar como arte ASCII.
 
 Se a foto já está no catálogo (mesmo `photo_id`), o monitor não consulta o
 Telegram de novo; se o usuário trocar a foto, a nova é baixada na próxima
