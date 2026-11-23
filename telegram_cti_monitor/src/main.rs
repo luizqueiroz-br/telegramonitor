@@ -9,7 +9,8 @@
  *   TELEGRAM_API_HASH    hash do app (obrigatório)
  *   TELEGRAM_PHONE       telefone internacional, usado só no primeiro login
  *   SESSION_PATH         arquivo de sessão (padrão: monitor.session)
- *   CTI_API_URL          URL da API CTI (opcional; vazio = só console)
+ *   CTI_API_URL          URL completa da API CTI (opcional; vazio = só console)
+ *   CTI_API_TOKEN        Bearer do portal CTI (obrigatório com CTI_API_URL)
  *   MONITORED_CHATS      ids de chat separados por vírgula (vazio = todos)
  *   OPENROUTER_API_KEY   liga a triagem (mensagens + agente de links)
  *   OPENROUTER_MSG_MODEL modelo leve da triagem e da decisão do agente
@@ -24,20 +25,21 @@ mod agent;
 mod dash;
 mod stats;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead as _, Write as _};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use grammers_client::media::Media;
+use grammers_client::media::{ChatPhoto, Media};
 use grammers_client::peer::{Peer, User};
 use grammers_client::sender::UpdatesConfiguration;
 use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
-use grammers_session::types::PeerRef;
+use grammers_session::types::{PeerRef, UpdateState, UpdatesState};
+use grammers_session::Session;
 use serde::{Deserialize, Serialize};
 
 // ============================================================
@@ -51,6 +53,7 @@ struct Config {
     session_path: String,
     db_path: String,
     cti_url: Option<String>,
+    cti_token: Option<String>,
     monitored_chats: Vec<i64>,
     msg_classifier: Option<MsgClassifier>,
 }
@@ -140,6 +143,7 @@ impl Config {
             session_path: lookup("SESSION_PATH").unwrap_or_else(|| "monitor.session".to_string()),
             db_path: lookup("DB_PATH").unwrap_or_else(|| "messages.db".to_string()),
             cti_url: lookup("CTI_API_URL"),
+            cti_token: lookup("CTI_API_TOKEN"),
             monitored_chats,
             msg_classifier,
         })
@@ -262,6 +266,29 @@ struct MonitoredMessage {
     edit_date: Option<String>,
 }
 
+/// Payload enviado à CTI: os campos da mensagem + a foto opcional, sem tocar
+/// no que fica gravado no SQLite local.
+#[derive(Serialize)]
+struct CtiMessage<'a> {
+    #[serde(flatten)]
+    message: &'a MonitoredMessage,
+    media_base64: Option<String>,
+}
+
+/// Ator do catálogo local, no formato de `POST /api/v1/actors` (API_CTI.md).
+#[derive(Serialize)]
+struct CtiActor {
+    telegram_id: i64,
+    username: Option<String>,
+    kind: String,
+    first_seen: Option<String>,
+    last_seen: Option<String>,
+    associated_groups: Option<Vec<i64>>,
+    tags: Option<Vec<String>>,
+    photo_base64: Option<String>,
+    photo_mime: Option<String>,
+}
+
 /// Colunas da tabela `messages`, na mesma ordem de [`MonitoredMessage::row_values`].
 /// A lista única gera o CREATE e migra bancos antigos.
 const MESSAGE_COLUMNS: &[(&str, &str)] = &[
@@ -312,7 +339,13 @@ const MESSAGE_COLUMNS: &[(&str, &str)] = &[
 ];
 
 /// Colunas locais: não fazem parte do JSON enviado à API CTI.
-const MESSAGE_EXTRA_COLUMNS: &[(&str, &str)] = &[("msg_kind", "TEXT")];
+const MESSAGE_EXTRA_COLUMNS: &[(&str, &str)] = &[("msg_kind", "TEXT"), ("media_blob", "BLOB")];
+
+/// Teto para a foto da mensagem guardada como BLOB (JPEG do Telegram é bem menor).
+const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
+
+/// Teto do contrato de envio (API_CTI.md): acima disso a foto fica só local.
+const CTI_MAX_MEDIA_BYTES: usize = 8 * 1024 * 1024;
 
 fn opt_text(value: &Option<String>) -> libsql::Value {
     match value {
@@ -553,32 +586,52 @@ async fn migrate_avatar_files(conn: &libsql::Connection) -> Result<(), String> {
 }
 
 /// Baixa a foto de perfil. `None` = a foto não foi achada ou já mudou.
+/// Baixa a foto do perfil direto pelo id. Evita `messages.search`, que o
+/// Telegram às vezes recusa com 500.
 async fn download_avatar(
     client: &Client,
     peer_ref: PeerRef,
     wanted_photo_id: i64,
-) -> Result<Option<Vec<u8>>, String> {
-    let mut photos = client.iter_profile_photos(peer_ref);
-    while let Some(photo) = photos
+) -> Result<Vec<u8>, String> {
+    let photo = ChatPhoto {
+        raw: tl::enums::InputFileLocation::InputPeerPhotoFileLocation(
+            tl::types::InputPeerPhotoFileLocation {
+                big: true,
+                peer: peer_ref.into(),
+                photo_id: wanted_photo_id,
+            },
+        ),
+    };
+    let mut download = client.iter_download(&photo);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = download
         .next()
         .await
-        .map_err(|e| format!("consulta de fotos: {e}"))?
+        .map_err(|e| format!("download da foto: {e}"))?
     {
-        if photo.id() != wanted_photo_id {
-            continue;
-        }
-        let mut download = client.iter_download(&photo);
-        let mut bytes = Vec::new();
-        while let Some(chunk) = download
-            .next()
-            .await
-            .map_err(|e| format!("download da foto: {e}"))?
-        {
-            bytes.extend_from_slice(&chunk);
-        }
-        return Ok(Some(bytes));
+        bytes.extend_from_slice(&chunk);
     }
-    Ok(None)
+    Ok(bytes)
+}
+
+/// Baixa a foto anexada à mensagem (JPEG) para gravar como BLOB.
+async fn download_media(
+    client: &Client,
+    photo: &grammers_client::media::Photo,
+) -> Result<Vec<u8>, String> {
+    let mut download = client.iter_download(photo);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = download
+        .next()
+        .await
+        .map_err(|e| format!("download da foto da mensagem: {e}"))?
+    {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_MEDIA_BYTES {
+            return Err(format!("foto acima de {MAX_MEDIA_BYTES} bytes"));
+        }
+    }
+    Ok(bytes)
 }
 
 fn chat_photo_id(peer: &Peer) -> Option<i64> {
@@ -591,70 +644,33 @@ fn chat_photo_id(peer: &Peer) -> Option<i64> {
 }
 
 /// Baixa a foto só quando ela ainda não está no catálogo (uma vez por entidade).
-async fn ensure_user_avatar(
+async fn ensure_avatar(
     client: &Client,
     store: &MessageStore,
-    user: &User,
+    table: &str,
+    id: i64,
+    wanted_photo_id: i64,
     peer_ref: Option<PeerRef>,
 ) {
-    let id = user.id().bot_api_dialog_id_unchecked();
-    let wanted = user.photo().map(|photo| photo.photo_id).unwrap_or(0);
-    if store.avatar_photo_id("users", id).await == Some(wanted) {
+    if store.avatar_photo_id(table, id).await == Some(wanted_photo_id) {
         return;
     }
-    if wanted == 0 {
-        let _ = store.set_avatar("users", id, 0, None).await;
+    if wanted_photo_id == 0 {
+        let _ = store.set_avatar(table, id, 0, None).await;
         return;
     }
     let Some(peer_ref) = peer_ref else { return };
     // Uma foto a cada 2 s: rajadas de remetentes novos não viram rajada de API.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    match download_avatar(client, peer_ref, wanted).await {
-        Ok(Some(bytes)) => {
-            let _ = store.set_avatar("users", id, wanted, Some(&bytes)).await;
-        }
-        Ok(None) => {
-            let _ = store.set_avatar("users", id, 0, None).await;
+    match download_avatar(client, peer_ref, wanted_photo_id).await {
+        Ok(bytes) => {
+            let _ = store.set_avatar(table, id, wanted_photo_id, Some(&bytes)).await;
         }
         Err(e) => {
-            eprintln!("[aviso] foto do usuário {id}: {e}");
+            eprintln!("[aviso] foto de {table} {id}: {e}");
             // Falha (inclusive FLOOD_WAIT) não se repete a cada mensagem:
             // marca esta versão da foto como tentada.
-            let _ = store.set_avatar("users", id, wanted, None).await;
-        }
-    }
-}
-
-/// Mesma ideia de [`ensure_user_avatar`], para grupos/canais.
-async fn ensure_chat_avatar(
-    client: &Client,
-    store: &MessageStore,
-    peer: &Peer,
-    peer_ref: Option<PeerRef>,
-) {
-    let id = peer.id().bot_api_dialog_id_unchecked();
-    let wanted = chat_photo_id(peer).unwrap_or(0);
-    if store.avatar_photo_id("chats", id).await == Some(wanted) {
-        return;
-    }
-    if wanted == 0 {
-        let _ = store.set_avatar("chats", id, 0, None).await;
-        return;
-    }
-    let Some(peer_ref) = peer_ref else { return };
-    // Mesmo espaçamento dos usuários.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    match download_avatar(client, peer_ref, wanted).await {
-        Ok(Some(bytes)) => {
-            let _ = store.set_avatar("chats", id, wanted, Some(&bytes)).await;
-        }
-        Ok(None) => {
-            let _ = store.set_avatar("chats", id, 0, None).await;
-        }
-        Err(e) => {
-            eprintln!("[aviso] foto do chat {id}: {e}");
-            // Idem usuários: uma tentativa por versão da foto.
-            let _ = store.set_avatar("chats", id, wanted, None).await;
+            let _ = store.set_avatar(table, id, wanted_photo_id, None).await;
         }
     }
 }
@@ -764,9 +780,34 @@ impl MessageStore {
         .await
         .map_err(|e| format!("Falha ao criar as tabelas de catálogo: {e}"))?;
         // Fotos passaram de arquivo para BLOB: migra o que sobrou em avatars/.
-        for table in ["users", "chats"] {
-            ensure_columns(&conn, table, &[("avatar_blob", "BLOB")]).await?;
-        }
+        ensure_columns(
+            &conn,
+            "users",
+            &[
+                ("avatar_blob", "BLOB"),
+                ("usernames", "TEXT"),
+                ("is_premium", "INTEGER"),
+                ("is_support", "INTEGER"),
+                ("is_fake", "INTEGER"),
+                ("is_restricted", "INTEGER"),
+                ("lang_code", "TEXT"),
+            ],
+        )
+        .await?;
+        ensure_columns(
+            &conn,
+            "chats",
+            &[
+                ("avatar_blob", "BLOB"),
+                ("usernames", "TEXT"),
+                ("participants", "INTEGER"),
+                ("is_verified", "INTEGER"),
+                ("is_scam", "INTEGER"),
+                ("is_fake", "INTEGER"),
+                ("is_restricted", "INTEGER"),
+            ],
+        )
+        .await?;
         migrate_avatar_files(&conn).await?;
         // Bancos criados antes do agente ganham as colunas novas sem perder dados.
         ensure_columns(
@@ -817,13 +858,61 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Foto da mensagem ainda não gravada?
+    async fn media_blob_missing(&self, chat_id: i64, message_id: i64) -> bool {
+        let Ok(mut rows) = self
+            .conn
+            .query(
+                "SELECT 1 FROM messages
+                 WHERE chat_id = ? AND message_id = ? AND media_blob IS NULL",
+                libsql::params![chat_id, message_id],
+            )
+            .await
+        else {
+            return false;
+        };
+        matches!(rows.next().await, Ok(Some(_)))
+    }
+
+    /// Grava a foto da mensagem uma única vez (BLOB), completando o MIME.
+    async fn set_media_blob(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE messages
+                 SET media_blob = ?, media_mime = COALESCE(media_mime, 'image/jpeg')
+                 WHERE chat_id = ? AND message_id = ? AND media_blob IS NULL",
+                libsql::params![opt_blob(Some(bytes)), chat_id, message_id],
+            )
+            .await
+            .map_err(|e| format!("Falha ao gravar a foto da mensagem: {e}"))?;
+        Ok(())
+    }
+
     /// Catálogo de usuários: dados vindos dos próprios updates (sem chamada extra).
     async fn upsert_user(&self, user: &User) -> Result<(), String> {
+        let (is_premium, is_fake) = match &user.raw {
+            tl::enums::User::User(raw) => (Some(raw.premium as i64), Some(raw.fake as i64)),
+            tl::enums::User::Empty(_) => (None, None),
+        };
+        let mut usernames = user.usernames();
+        if let Some(name) = user.username()
+            && !usernames.contains(&name)
+        {
+            usernames.push(name);
+        }
+        let usernames = serde_json::to_string(&usernames).ok();
         self.conn
             .execute(
                 "INSERT INTO users (id, username, first_name, last_name, phone,
-                    is_bot, is_verified, is_scam, is_deleted, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    is_bot, is_verified, is_scam, is_deleted,
+                    usernames, is_premium, is_support, is_fake, is_restricted, lang_code,
+                    updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                  ON CONFLICT(id) DO UPDATE SET
                     username = excluded.username,
                     first_name = excluded.first_name,
@@ -833,6 +922,12 @@ impl MessageStore {
                     is_verified = excluded.is_verified,
                     is_scam = excluded.is_scam,
                     is_deleted = excluded.is_deleted,
+                    usernames = COALESCE(excluded.usernames, users.usernames),
+                    is_premium = COALESCE(excluded.is_premium, users.is_premium),
+                    is_support = COALESCE(excluded.is_support, users.is_support),
+                    is_fake = COALESCE(excluded.is_fake, users.is_fake),
+                    is_restricted = COALESCE(excluded.is_restricted, users.is_restricted),
+                    lang_code = COALESCE(excluded.lang_code, users.lang_code),
                     updated_at = CURRENT_TIMESTAMP",
                 libsql::params![
                     user.id().bot_api_dialog_id_unchecked(),
@@ -844,6 +939,12 @@ impl MessageStore {
                     user.verified() as i64,
                     user.scam() as i64,
                     user.deleted() as i64,
+                    opt_text(&usernames),
+                    opt_int(is_premium),
+                    opt_int(Some(user.support() as i64)),
+                    opt_int(is_fake),
+                    opt_int(Some(user.restricted() as i64)),
+                    opt_text(&opt_str(user.lang_code())),
                 ],
             )
             .await
@@ -859,20 +960,64 @@ impl MessageStore {
             Peer::Community(community) => (community.title().to_string(), None, "community"),
             Peer::User(_) => return Ok(()),
         };
+        let (participants, is_verified, is_scam, is_fake, is_restricted) = match peer {
+            Peer::Group(group) => match &group.raw {
+                // Megagrupo chega como `Chat::Channel` no TL desta camada.
+                tl::enums::Chat::Channel(channel) => (
+                    channel.participants_count.map(i64::from),
+                    Some(channel.verified as i64),
+                    Some(channel.scam as i64),
+                    Some(channel.fake as i64),
+                    Some(channel.restricted as i64),
+                ),
+                tl::enums::Chat::Chat(chat) => {
+                    (Some(chat.participants_count as i64), None, None, None, None)
+                }
+                _ => (None, None, None, None, None),
+            },
+            Peer::Channel(channel) => (
+                channel.raw.participants_count.map(i64::from),
+                Some(channel.raw.verified as i64),
+                Some(channel.raw.scam as i64),
+                Some(channel.raw.fake as i64),
+                Some(channel.raw.restricted as i64),
+            ),
+            _ => (None, None, None, None, None),
+        };
+        let mut usernames = peer.usernames();
+        if let Some(name) = peer.username()
+            && !usernames.contains(&name)
+        {
+            usernames.push(name);
+        }
+        let usernames = serde_json::to_string(&usernames).ok();
         self.conn
             .execute(
-                "INSERT INTO chats (id, title, username, kind, updated_at)
-                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                "INSERT INTO chats (id, title, username, kind, usernames,
+                    participants, is_verified, is_scam, is_fake, is_restricted, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                  ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     username = excluded.username,
                     kind = excluded.kind,
+                    usernames = COALESCE(excluded.usernames, chats.usernames),
+                    participants = COALESCE(excluded.participants, chats.participants),
+                    is_verified = COALESCE(excluded.is_verified, chats.is_verified),
+                    is_scam = COALESCE(excluded.is_scam, chats.is_scam),
+                    is_fake = COALESCE(excluded.is_fake, chats.is_fake),
+                    is_restricted = COALESCE(excluded.is_restricted, chats.is_restricted),
                     updated_at = CURRENT_TIMESTAMP",
                 libsql::params![
                     peer.id().bot_api_dialog_id_unchecked(),
                     title,
                     opt_text(&username),
                     kind,
+                    opt_text(&usernames),
+                    opt_int(participants),
+                    opt_int(is_verified),
+                    opt_int(is_scam),
+                    opt_int(is_fake),
+                    opt_int(is_restricted),
                 ],
             )
             .await
@@ -912,6 +1057,43 @@ impl MessageStore {
             .await
             .map_err(|e| format!("Falha ao salvar avatar: {e}"))?;
         Ok(())
+    }
+
+    /// Dados do ator já gravados, para o envio à CTI: (username, kind, foto).
+    async fn actor_for_cti(
+        &self,
+        table: &str,
+        id: i64,
+    ) -> Result<Option<(Option<String>, String, Option<Vec<u8>>)>, String> {
+        let sql = if table == "users" {
+            "SELECT username, 'user', avatar_blob FROM users WHERE id = ?"
+        } else {
+            "SELECT username, COALESCE(kind, 'unknown'), avatar_blob FROM chats WHERE id = ?"
+        };
+        let mut rows = self
+            .conn
+            .query(sql, libsql::params![id])
+            .await
+            .map_err(|e| format!("Falha ao ler o ator: {e}"))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| format!("Falha ao ler o ator: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let username = row.get::<String>(0).ok();
+        let kind = row
+            .get::<String>(1)
+            .map_err(|e| format!("Coluna inválida: {e}"))?;
+        let photo = match row
+            .get_value(2)
+            .map_err(|e| format!("Coluna inválida: {e}"))?
+        {
+            libsql::Value::Blob(bytes) => Some(bytes),
+            _ => None,
+        };
+        Ok(Some((username, kind, photo)))
     }
 
     async fn recent(&self, limit: u32) -> Result<Vec<(String, String, String, String)>, String> {        let mut rows = self
@@ -1053,37 +1235,168 @@ async fn ensure_logged_in(client: &Client, config: &mut Config) -> Result<(), St
     Ok(())
 }
 
+/// O Telegram às vezes recusa o pts salvo (500 RPC_CALL_FAIL) e o stream de
+/// updates nunca mais recupera. Testa o estado antes; se falhar, recomeça.
+async fn repair_update_state(client: &Client, session: &SqliteSession) {
+    let Ok(state) = session.updates_state().await else {
+        return;
+    };
+    if state.pts == 0 {
+        return;
+    }
+    let probe = tl::functions::updates::GetDifference {
+        pts: state.pts,
+        pts_limit: None,
+        pts_total_limit: None,
+        date: state.date,
+        qts: state.qts,
+        qts_limit: None,
+    };
+    if let Err(e) = client.invoke(&probe).await {
+        println!(
+            "[aviso] Telegram recusou o estado de updates ({e}); recomeçando sem recuperar mensagens perdidas."
+        );
+        if let Err(e) = session
+            .set_update_state(UpdateState::All(UpdatesState::default()))
+            .await
+        {
+            eprintln!("[aviso] Falha ao limpar o estado de updates: {e}");
+        }
+    }
+}
+
 // ============================================================
 // ENVIO PARA O CTI
 // ============================================================
 
-/// Enviar mensagem para a API CTI
-async fn send_to_cti_api(cti_url: &str, msg: &MonitoredMessage) -> Result<(), String> {
-    let json_body = serde_json::to_string(msg)
-        .map_err(|e| format!("Erro ao serializar JSON: {}", e))?;
-
-    // curl evita compilar TLS em Rust
-    let output = Command::new("curl")
-        .args(["-s", "-m", "30", "-X", "POST", "-H", "Content-Type: application/json", "-d", &json_body, cti_url])
-        .output();
-
-    match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            if !stderr.is_empty() {
-                eprintln!("[curl] stderr: {}", stderr);
-            }
-            if !output.status.success() {
-                return Err(format!("curl saiu com {}: {}", output.status, stderr));
-            }
-            if stdout.contains("error") {
-                return Err(format!("API CTI retornou erro: {}", stdout));
-            }
-            Ok(())
-        }
-        Err(e) => Err(format!("Falha ao executar curl: {}", e)),
+/// Monta os argumentos do curl. O Bearer só entra quando há token.
+fn cti_curl_args(cti_url: &str, token: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-s",
+        "-m",
+        "30",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        // Corpo por stdin: um argumento tem limite de ~128 KiB e a foto passa disso.
+        "--data-binary",
+        "@-",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(token) = token {
+        args.extend(["-H".to_string(), format!("Authorization: Bearer {token}")]);
     }
+    args.push(cti_url.to_string());
+    args
+}
+
+/// Base64 padrão com padding (RFC 4648, sem quebras) — o contrato da CTI pede
+/// exatamente isso e evita mais uma dependência.
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// `https://host/api/v1/telegram/messages` → `https://host/api/v1/actors`.
+/// shortcut: assume esse path fixo; se a CTI mudar a base, usar CTI_ACTORS_URL.
+fn cti_actors_url(cti_url: &str) -> Option<String> {
+    let (scheme, rest) = cti_url.split_once("://")?;
+    let host = rest.split('/').next()?;
+    Some(format!("{scheme}://{host}/api/v1/actors"))
+}
+
+/// POST JSON via curl. O corpo vai por stdin (o base64 da foto estoura argv).
+async fn post_json(url: &str, token: Option<&str>, body: &str) -> Result<(), String> {
+    // curl evita compilar TLS em Rust
+    let mut child = Command::new("curl")
+        .args(cti_curl_args(url, token))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Falha ao executar curl: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("curl sem stdin")?;
+    let write = stdin.write_all(body.as_bytes());
+    drop(stdin); // EOF para o curl enviar
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Falha ao aguardar curl: {e}"))?;
+    write.map_err(|e| format!("Falha ao enviar corpo ao curl: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        eprintln!("[curl] stderr: {stderr}");
+    }
+    if !output.status.success() {
+        return Err(format!("curl saiu com {}: {stderr}", output.status));
+    }
+    if stdout.contains("error") {
+        return Err(format!("API CTI retornou erro: {stdout}"));
+    }
+    Ok(())
+}
+
+/// Envia a mensagem (a foto vai numa segunda chamada, quando houver).
+async fn send_to_cti_api(
+    cti_url: &str,
+    cti_token: Option<&str>,
+    msg: &MonitoredMessage,
+    media: Option<&[u8]>,
+) -> Result<(), String> {
+    let body = CtiMessage {
+        message: msg,
+        media_base64: media.map(base64_encode),
+    };
+    let json_body =
+        serde_json::to_string(&body).map_err(|e| format!("Erro ao serializar JSON: {e}"))?;
+    post_json(cti_url, cti_token, &json_body).await
+}
+
+/// Envia um ator do catálogo local para `POST /api/v1/actors`.
+async fn send_actor_to_cti(
+    url: &str,
+    token: Option<&str>,
+    telegram_id: i64,
+    username: Option<String>,
+    kind: String,
+    photo: Option<Vec<u8>>,
+) -> Result<(), String> {
+    let actor = CtiActor {
+        telegram_id,
+        username,
+        kind,
+        first_seen: None,
+        last_seen: None,
+        associated_groups: None,
+        tags: None,
+        photo_mime: photo.as_ref().map(|_| "image/jpeg".to_string()),
+        photo_base64: photo.as_deref().map(base64_encode),
+    };
+    let json_body =
+        serde_json::to_string(&actor).map_err(|e| format!("Erro ao serializar ator: {e}"))?;
+    post_json(url, token, &json_body).await
 }
 
 // ============================================================
@@ -1206,6 +1519,7 @@ async fn handle_message(
     config: &Config,
     store: &MessageStore,
     message: grammers_client::update::Message,
+    sent_actors: &mut HashSet<i64>,
 ) {
     let chat_id = message.peer_id().bot_api_dialog_id().unwrap_or_default();
 
@@ -1390,30 +1704,118 @@ async fn handle_message(
         }
     }
 
-    if let Some(cti_url) = &config.cti_url
-        && msg_kind != Some("ad")
+    // Anúncio fica só local; conversa vai à CTI. A foto, quando houver, segue
+    // num segundo POST para a ingestão não esperar o download.
+    let cti_url = config.cti_url.as_deref().filter(|_| msg_kind != Some("ad"));
+    if let Some(cti_url) = cti_url {
+        if let Err(e) =
+            send_to_cti_api(cti_url, config.cti_token.as_deref(), &monitored_msg, None).await
+        {
+            eprintln!("[ERRO] Falha ao enviar para API CTI: {e}");
+        }
+    }
+
+    // Foto da mensagem: BLOB local; depois o mesmo POST é repetido com a foto.
+    if let Some(Media::Photo(photo)) = media.as_ref()
+        && store
+            .media_blob_missing(monitored_msg.chat_id, monitored_msg.message_id)
+            .await
     {
-        if let Err(e) = send_to_cti_api(cti_url, &monitored_msg).await {
-            eprintln!("[ERRO] Falha ao enviar para API CTI: {}", e);
+        match download_media(client, photo).await {
+            Ok(bytes) => {
+                if let Err(e) = store
+                    .set_media_blob(monitored_msg.chat_id, monitored_msg.message_id, &bytes)
+                    .await
+                {
+                    eprintln!("[ERRO] {e}");
+                }
+                if let Some(cti_url) = cti_url
+                    && bytes.len() <= CTI_MAX_MEDIA_BYTES
+                {
+                    if let Err(e) = send_to_cti_api(
+                        cti_url,
+                        config.cti_token.as_deref(),
+                        &monitored_msg,
+                        Some(&bytes),
+                    )
+                    .await
+                    {
+                        eprintln!("[ERRO] Falha ao enviar foto para API CTI: {e}");
+                    }
+                }
+            }
+            Err(e) => eprintln!(
+                "[aviso] foto da mensagem {}: {e}",
+                monitored_msg.message_id
+            ),
         }
     }
 
     // Catálogo: usa os objetos que já vieram no update (sem consulta extra).
     // A foto só é baixada uma vez por entidade e fica como BLOB no banco.
+    let actors_url = config.cti_url.as_deref().and_then(cti_actors_url);
     let sender_ref = message.sender_ref().await.ok().flatten();
     let peer_ref = message.peer_ref().await.ok().flatten();
     if let Some(Peer::User(user)) = message.sender() {
-        if let Err(e) = store.upsert_user(user).await {
+        let id = user.id().bot_api_dialog_id_unchecked();
+        let wanted = user.photo().map(|photo| photo.photo_id).unwrap_or(0);
+        if let Err(e) = store.upsert_user(&user).await {
             eprintln!("[ERRO] {e}");
         }
-        ensure_user_avatar(client, store, user, sender_ref).await;
+        ensure_avatar(client, store, "users", id, wanted, sender_ref).await;
+        if let Some(url) = actors_url.as_deref()
+            && sent_actors.insert(id)
+        {
+            match store.actor_for_cti("users", id).await {
+                Ok(Some((username, kind, photo))) => {
+                    if let Err(e) = send_actor_to_cti(
+                        url,
+                        config.cti_token.as_deref(),
+                        id,
+                        username,
+                        kind,
+                        photo,
+                    )
+                    .await
+                    {
+                        eprintln!("[ERRO] Falha ao enviar ator para API CTI: {e}");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("[ERRO] {e}"),
+            }
+        }
     }
     if let Some(chat_peer) = message.peer() {
         if !matches!(chat_peer, Peer::User(_)) {
-            if let Err(e) = store.upsert_chat(chat_peer).await {
+            let id = chat_peer.id().bot_api_dialog_id_unchecked();
+            let wanted = chat_photo_id(&chat_peer).unwrap_or(0);
+            if let Err(e) = store.upsert_chat(&chat_peer).await {
                 eprintln!("[ERRO] {e}");
             }
-            ensure_chat_avatar(client, store, chat_peer, peer_ref).await;
+            ensure_avatar(client, store, "chats", id, wanted, peer_ref).await;
+            if let Some(url) = actors_url.as_deref()
+                && sent_actors.insert(id)
+            {
+                match store.actor_for_cti("chats", id).await {
+                    Ok(Some((username, kind, photo))) => {
+                        if let Err(e) = send_actor_to_cti(
+                            url,
+                            config.cti_token.as_deref(),
+                            id,
+                            username,
+                            kind,
+                            photo,
+                        )
+                        .await
+                        {
+                            eprintln!("[ERRO] Falha ao enviar ator para API CTI: {e}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[ERRO] {e}"),
+                }
+            }
         }
     }
 
@@ -1444,6 +1846,9 @@ async fn handle_message(
 async fn run() -> Result<(), String> {
     let dotenv = load_dotenv(".env");
     let mut config = Config::from_env(&dotenv)?;
+    if config.cti_url.is_some() && config.cti_token.is_none() {
+        println!("[aviso] CTI_API_URL definida sem CTI_API_TOKEN: a ingestão deve responder 401.");
+    }
     ensure_api_credentials(&mut config)?;
     let api_id = config.api_id.ok_or("API_ID ausente.")?;
     let store = MessageStore::open(&config.db_path).await?;
@@ -1465,7 +1870,7 @@ async fn run() -> Result<(), String> {
         runner,
         updates,
         handle,
-    } = SenderPool::new(session, api_id);
+    } = SenderPool::new(session.clone(), api_id);
     let client = Client::new(handle.clone());
     let pool_task = tokio::spawn(runner.run());
 
@@ -1485,18 +1890,26 @@ async fn run() -> Result<(), String> {
         }
     }
 
-    // Listar os chats da conta (mostra os ids e popula o cache de peers dos updates)
+    // Listar os chats da conta (mostra os ids e popula o cache de peers dos updates).
+    // É só informativo: se o Telegram recusar a listagem, o monitor segue.
     println!("\nChats da conta:");
     let mut dialogs = client.iter_dialogs();
-    while let Some(dialog) = dialogs
-        .next()
-        .await
-        .map_err(|e| format!("Falha ao listar os chats: {e}"))?
-    {
-        let id = dialog.peer_id().bot_api_dialog_id().unwrap_or_default();
-        let name = dialog.peer().name().unwrap_or("(sem nome)");
-        println!("  {id}  {name}");
+    loop {
+        match dialogs.next().await {
+            Ok(Some(dialog)) => {
+                let id = dialog.peer_id().bot_api_dialog_id().unwrap_or_default();
+                let name = dialog.peer().name().unwrap_or("(sem nome)");
+                println!("  {id}  {name}");
+            }
+            Ok(None) => break,
+            Err(e) => {
+                println!("  [aviso] Telegram recusou listar os chats: {e}");
+                break;
+            }
+        }
     }
+
+    repair_update_state(&client, &session).await;
 
     println!(
         "\nMonitorando {} (Ctrl+C para sair)...\n",
@@ -1512,13 +1925,14 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("Falha ao iniciar o stream de updates: {e}"))?;
 
+    let mut sent_actors = HashSet::new();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             update = stream.next() => {
                 let update = update.map_err(|e| format!("Erro ao receber update: {e}"))?;
                 if let Update::NewMessage(message) = update {
-                    handle_message(&client, &config, &store, message).await;
+                    handle_message(&client, &config, &store, message, &mut sent_actors).await;
                 }
             }
         }
@@ -1612,6 +2026,42 @@ mod tests {
         assert_eq!(parse_decisions_kind(&answers).unwrap(), "ad");
         assert!(parse_decisions_kind(&serde_json::json!({})).is_err());
         assert!(parse_decisions_kind(&serde_json::json!({"kind":{"choice":"talvez"}})).is_err());
+    }
+
+    #[test]
+    fn bearer_so_entra_com_token() {
+        use super::cti_curl_args;
+        let with = cti_curl_args("http://x", Some("t"));
+        assert!(with.windows(2).any(|w| w[0] == "-H" && w[1] == "Authorization: Bearer t"));
+        let without = cti_curl_args("http://x", None);
+        assert!(!without.iter().any(|a| a.starts_with("Authorization")));
+        // Corpo por stdin: nenhum argumento carrega o JSON (limite ~128 KiB).
+        assert!(with.windows(2).any(|w| w[0] == "--data-binary" && w[1] == "@-"));
+    }
+
+    #[test]
+    fn base64_padrao_com_padding() {
+        use super::base64_encode;
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xff, 0xd8, 0xff]), "/9j/");
+    }
+
+    #[test]
+    fn url_de_atores_deriva_do_host() {
+        use super::cti_actors_url;
+        assert_eq!(
+            cti_actors_url("https://cti.exemplo/api/v1/telegram/messages").as_deref(),
+            Some("https://cti.exemplo/api/v1/actors")
+        );
+        assert_eq!(
+            cti_actors_url("http://127.0.0.1:8000/api/v1/telegram/messages").as_deref(),
+            Some("http://127.0.0.1:8000/api/v1/actors")
+        );
+        assert_eq!(cti_actors_url("sem-esquema"), None);
     }
 
     fn temp_db() -> String {
@@ -1731,6 +2181,69 @@ mod tests {
         let mode: String = pragma.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
 
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn foto_da_mensagem_grava_uma_vez() {
+        let path = temp_db();
+        let store = super::MessageStore::open(&path).await.unwrap();
+        store.insert(&sample()).await.unwrap();
+
+        assert!(store.media_blob_missing(-100123, 7).await);
+        store.set_media_blob(-100123, 7, b"jpeg").await.unwrap();
+        assert!(!store.media_blob_missing(-100123, 7).await);
+
+        // Segunda gravação não sobrescreve a primeira.
+        store.set_media_blob(-100123, 7, b"outra").await.unwrap();
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT media_blob FROM messages WHERE chat_id = -100123 AND message_id = 7",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        match row.get_value(0).unwrap() {
+            libsql::Value::Blob(blob) => assert_eq!(blob, b"jpeg".to_vec()),
+            other => panic!("esperava BLOB, veio {other:?}"),
+        }
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn actor_para_cti_le_username_kind_e_foto() {
+        let path = temp_db();
+        let store = super::MessageStore::open(&path).await.unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO users (id, username, avatar_blob) VALUES (5, 'fulano', ?)",
+                libsql::params![libsql::Value::Blob(b"foto".to_vec())],
+            )
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO chats (id, title, kind) VALUES (-100, 'G', 'channel')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let user = store.actor_for_cti("users", 5).await.unwrap().unwrap();
+        assert_eq!(user.0.as_deref(), Some("fulano"));
+        assert_eq!(user.1, "user");
+        assert_eq!(user.2.as_deref(), Some(&b"foto"[..]));
+
+        let chat = store.actor_for_cti("chats", -100).await.unwrap().unwrap();
+        assert_eq!(chat.1, "channel");
+        assert!(chat.2.is_none());
+
+        assert!(store.actor_for_cti("users", 999).await.unwrap().is_none());
         cleanup(&path);
     }
 
