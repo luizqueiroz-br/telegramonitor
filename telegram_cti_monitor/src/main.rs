@@ -27,9 +27,11 @@ mod stats;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead as _, Write as _};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 use grammers_client::media::{ChatPhoto, Media};
 use grammers_client::peer::{Peer, User};
@@ -1346,13 +1348,16 @@ async fn post_json(url: &str, token: Option<&str>, body: &str) -> Result<(), Str
         .spawn()
         .map_err(|e| format!("Falha ao executar curl: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("curl sem stdin")?;
-    let write = stdin.write_all(body.as_bytes());
+    stdin
+        .write_all(body.as_bytes())
+        .await
+        .map_err(|e| format!("Falha ao enviar corpo ao curl: {e}"))?;
     drop(stdin); // EOF para o curl enviar
 
     let output = child
         .wait_with_output()
+        .await
         .map_err(|e| format!("Falha ao aguardar curl: {e}"))?;
-    write.map_err(|e| format!("Falha ao enviar corpo ao curl: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.is_empty() {
@@ -1717,11 +1722,18 @@ async fn handle_message(
     // num segundo POST para a ingestão não esperar o download.
     let cti_url = config.cti_url.as_deref().filter(|_| msg_kind != Some("ad"));
     if let Some(cti_url) = cti_url {
-        if let Err(e) =
-            send_to_cti_api(cti_url, config.cti_token.as_deref(), &monitored_msg, None).await
-        {
-            eprintln!("[ERRO] Falha ao enviar para API CTI: {e}");
-        }
+        let cti_url = cti_url.to_string();
+        let cti_token = config.cti_token.clone();
+        let monitored_msg = monitored_msg.clone();
+        // O INSERT no SQLite já aconteceu e é a fonte de verdade; fire-and-forget
+        // para uma API lenta não travar a ingestão (ordem no CTI não garantida).
+        tokio::spawn(async move {
+            if let Err(e) =
+                send_to_cti_api(&cti_url, cti_token.as_deref(), &monitored_msg, None).await
+            {
+                eprintln!("[ERRO] Falha ao enviar para API CTI: {e}");
+            }
+        });
     }
 
     // Foto da mensagem: BLOB local; depois o mesmo POST é repetido com a foto.
@@ -1741,16 +1753,22 @@ async fn handle_message(
                 if let Some(cti_url) = cti_url
                     && bytes.len() <= CTI_MAX_MEDIA_BYTES
                 {
-                    if let Err(e) = send_to_cti_api(
-                        cti_url,
-                        config.cti_token.as_deref(),
-                        &monitored_msg,
-                        Some(&bytes),
-                    )
-                    .await
-                    {
-                        eprintln!("[ERRO] Falha ao enviar foto para API CTI: {e}");
-                    }
+                    let cti_url = cti_url.to_string();
+                    let cti_token = config.cti_token.clone();
+                    let monitored_msg = monitored_msg.clone();
+                    // Mesmo motivo do POST da mensagem: não segurar a ingestão.
+                    tokio::spawn(async move {
+                        if let Err(e) = send_to_cti_api(
+                            &cti_url,
+                            cti_token.as_deref(),
+                            &monitored_msg,
+                            Some(&bytes),
+                        )
+                        .await
+                        {
+                            eprintln!("[ERRO] Falha ao enviar foto para API CTI: {e}");
+                        }
+                    });
                 }
             }
             Err(e) => eprintln!(
