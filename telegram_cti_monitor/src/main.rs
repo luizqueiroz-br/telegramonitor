@@ -712,6 +712,9 @@ impl MessageStore {
         .map_err(|e| format!("Falha ao criar a tabela messages: {e}"))?;
         ensure_columns(&conn, "messages", MESSAGE_COLUMNS).await?;
         ensure_columns(&conn, "messages", MESSAGE_EXTRA_COLUMNS).await?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);")
+            .await
+            .map_err(|e| format!("Falha ao criar índice em messages.timestamp: {e}"))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
