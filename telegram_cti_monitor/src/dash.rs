@@ -723,10 +723,13 @@ async fn reload(app: &mut App, store: &MessageStore) -> Result<(), String> {
 
 /// Atualiza a cada 2 s: feed ao vivo ou lista filtrada.
 async fn refresh(app: &mut App, store: &MessageStore) -> Result<(), String> {
+    let prev_last = app.last_id;
     if app.filters.active() {
         let keep_id = app.selected_row().map(|row| row.id);
         app.feed = query_rows(store, &app.filters, app.window, LIST_LIMIT as u32).await?;
-        app.rows_total = count_rows(store, &app.filters, app.window).await?;
+        // O feed só traz o que casa com o filtro; MAX(id) (O(1) na PK) detecta
+        // qualquer insert para o gate de count/totals valer também aqui.
+        app.last_id = app.last_id.max(max_id(store).await?);
         app.selected = keep_id
             .and_then(|id| app.feed.iter().rev().position(|row| row.id == id))
             .unwrap_or(0);
@@ -746,14 +749,17 @@ async fn refresh(app: &mut App, store: &MessageStore) -> Result<(), String> {
         if added > 0 && app.selected > 0 {
             app.selected += added; // mantém a linha em foco enquanto chegam novas
         }
-        app.rows_total = count_rows(store, &app.filters, app.window).await?;
         app.clamp_selection();
     }
 
-    let (total, chats, senders) = totals(store).await?;
-    app.total = total;
-    app.chats = chats;
-    app.senders = senders;
+    // Débito: janela deslize — linhas que saem da janela sem insert novo deixam rows_total defasado até o próximo insert ou `r`.
+    if app.last_id != prev_last {
+        app.rows_total = count_rows(store, &app.filters, app.window).await?;
+        let (total, chats, senders) = totals(store).await?;
+        app.total = total;
+        app.chats = chats;
+        app.senders = senders;
+    }
     app.status.clear();
     Ok(())
 }
@@ -1073,6 +1079,20 @@ async fn totals(store: &MessageStore) -> Result<(i64, i64, i64), String> {
         row.get(1).unwrap_or(0),
         row.get(2).unwrap_or(0),
     ))
+}
+
+async fn max_id(store: &MessageStore) -> Result<i64, String> {
+    let mut rows = store
+        .conn
+        .query("SELECT MAX(id) FROM messages", ())
+        .await
+        .map_err(|e| format!("Falha ao ler último id: {e}"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| format!("Falha ao ler último id: {e}"))?
+        .ok_or("Leitura sem resultado")?;
+    Ok(row.get(0).unwrap_or(0))
 }
 
 async fn chat_options(store: &MessageStore) -> Result<Vec<ChatOption>, String> {
@@ -2171,6 +2191,65 @@ mod tests {
         filters.kind = Some("text".to_string());
         filters.links_only = false;
         assert_eq!(count_rows(&store, &filters, Window::All).await.unwrap(), 3);
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn refresh_reconta_só_quando_entra_linha_nova() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        insert(&store, 1, -100, 42, "primeira").await;
+        insert(&store, 2, -100, 42, "segunda").await;
+
+        let mut app = App::new();
+        app.window = Window::All;
+        reload(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (2, 2));
+
+        // Sentinelas: sem linha nova o refresh não pode recomputar (cache vale).
+        app.total = 999;
+        app.rows_total = 999;
+        refresh(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (999, 999));
+
+        insert(&store, 3, -100, 42, "terceira").await;
+        refresh(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (3, 3));
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn refresh_com_filtro_detecta_insert_global_pelo_max_id() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        insert(&store, 1, -100, 42, "cpf 123").await;
+        insert(&store, 2, -100, 42, "sem numero").await;
+
+        let mut app = App::new();
+        app.window = Window::All;
+        app.filters.search = Some("cpf".into());
+        reload(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (2, 1));
+
+        // Primeiro tick sincroniza last_id com o MAX(id) global (reload só vê o feed filtrado).
+        refresh(&mut app, &store).await.unwrap();
+
+        app.total = 999;
+        app.rows_total = 999;
+        refresh(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (999, 999));
+
+        // Insert que não casa com o filtro: o total global tem que subir.
+        insert(&store, 3, -100, 42, "outra").await;
+        refresh(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (3, 1));
+
+        // Insert que casa: sobe a contagem filtrada.
+        insert(&store, 4, -100, 42, "cpf 456").await;
+        refresh(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (4, 2));
 
         cleanup(&path);
     }
