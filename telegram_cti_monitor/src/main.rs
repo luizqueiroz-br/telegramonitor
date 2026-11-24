@@ -693,6 +693,9 @@ async fn ensure_avatar(
     }
 }
 
+// Clone compartilha a mesma Connection (Arc): as tasks em background usam o
+// banco com WAL + busy_timeout já configurados no open.
+#[derive(Clone)]
 struct MessageStore {
     conn: libsql::Connection,
 }
@@ -1789,21 +1792,25 @@ async fn handle_message(
         if let Err(e) = store.upsert_user(&user).await {
             eprintln!("[ERRO] {e}");
         }
-        ensure_avatar(client, store, "users", id, wanted, sender_ref).await;
-        if let Some(url) = actors_url.as_deref()
-            && sent_actors.insert(id)
-        {
+        // INSERT gravado; avatar e ator em fire-and-forget para download e POST
+        // não segurarem a ingestão. O gate do sent_actors vai antes do spawn
+        // (senão tasks concorrentes duplicariam o envio); o ator é lido depois
+        // do download para a primeira foto entrar no POST.
+        let actor_url = actors_url
+            .as_deref()
+            .filter(|_| sent_actors.insert(id))
+            .map(str::to_string);
+        let client = client.clone();
+        let store = store.clone();
+        let cti_token = config.cti_token.clone();
+        tokio::spawn(async move {
+            ensure_avatar(&client, &store, "users", id, wanted, sender_ref).await;
+            let Some(url) = actor_url else { return };
             match store.actor_for_cti("users", id).await {
                 Ok(Some((username, kind, photo))) => {
-                    if let Err(e) = send_actor_to_cti(
-                        url,
-                        config.cti_token.as_deref(),
-                        id,
-                        username,
-                        kind,
-                        photo,
-                    )
-                    .await
+                    if let Err(e) =
+                        send_actor_to_cti(&url, cti_token.as_deref(), id, username, kind, photo)
+                            .await
                     {
                         eprintln!("[ERRO] Falha ao enviar ator para API CTI: {e}");
                     }
@@ -1811,7 +1818,7 @@ async fn handle_message(
                 Ok(None) => {}
                 Err(e) => eprintln!("[ERRO] {e}"),
             }
-        }
+        });
     }
     if let Some(chat_peer) = message.peer() {
         if !matches!(chat_peer, Peer::User(_)) {
@@ -1820,21 +1827,22 @@ async fn handle_message(
             if let Err(e) = store.upsert_chat(&chat_peer).await {
                 eprintln!("[ERRO] {e}");
             }
-            ensure_avatar(client, store, "chats", id, wanted, peer_ref).await;
-            if let Some(url) = actors_url.as_deref()
-                && sent_actors.insert(id)
-            {
+            // Mesmo motivo do bloco do remetente: não segurar a ingestão.
+            let actor_url = actors_url
+                .as_deref()
+                .filter(|_| sent_actors.insert(id))
+                .map(str::to_string);
+            let client = client.clone();
+            let store = store.clone();
+            let cti_token = config.cti_token.clone();
+            tokio::spawn(async move {
+                ensure_avatar(&client, &store, "chats", id, wanted, peer_ref).await;
+                let Some(url) = actor_url else { return };
                 match store.actor_for_cti("chats", id).await {
                     Ok(Some((username, kind, photo))) => {
-                        if let Err(e) = send_actor_to_cti(
-                            url,
-                            config.cti_token.as_deref(),
-                            id,
-                            username,
-                            kind,
-                            photo,
-                        )
-                        .await
+                        if let Err(e) =
+                            send_actor_to_cti(&url, cti_token.as_deref(), id, username, kind, photo)
+                                .await
                         {
                             eprintln!("[ERRO] Falha ao enviar ator para API CTI: {e}");
                         }
@@ -1842,7 +1850,7 @@ async fn handle_message(
                     Ok(None) => {}
                     Err(e) => eprintln!("[ERRO] {e}"),
                 }
-            }
+            });
         }
     }
 
