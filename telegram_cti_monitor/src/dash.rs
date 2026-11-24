@@ -724,41 +724,50 @@ async fn reload(app: &mut App, store: &MessageStore) -> Result<(), String> {
 /// Atualiza a cada 2 s: feed ao vivo ou lista filtrada.
 async fn refresh(app: &mut App, store: &MessageStore) -> Result<(), String> {
     let prev_last = app.last_id;
+    let mut new_last = prev_last;
+    let mut pending: Vec<FeedRow> = Vec::new();
     if app.filters.active() {
         let keep_id = app.selected_row().map(|row| row.id);
         app.feed = query_rows(store, &app.filters, app.window, LIST_LIMIT as u32).await?;
         // O feed só traz o que casa com o filtro; MAX(id) (O(1) na PK) detecta
         // qualquer insert para o gate de count/totals valer também aqui.
-        app.last_id = app.last_id.max(max_id(store).await?);
+        new_last = new_last.max(max_id(store).await?);
         app.selected = keep_id
             .and_then(|id| app.feed.iter().rev().position(|row| row.id == id))
             .unwrap_or(0);
         app.clamp_selection();
     } else {
         let cutoff = stats::cutoff_iso(app.window);
-        let rows = live_rows(store, app.last_id, FEED_LIMIT as u32, cutoff.as_deref()).await?;
-        let added = rows.len();
-        for row in rows {
-            app.last_id = app.last_id.max(row.id);
-            app.feed.push(row);
+        pending = live_rows(store, prev_last, FEED_LIMIT as u32, cutoff.as_deref()).await?;
+        for row in &pending {
+            new_last = new_last.max(row.id);
         }
-        if app.feed.len() > FEED_LIMIT {
-            let excess = app.feed.len() - FEED_LIMIT;
-            app.feed.drain(..excess);
-        }
-        if added > 0 && app.selected > 0 {
-            app.selected += added; // mantém a linha em foco enquanto chegam novas
-        }
-        app.clamp_selection();
     }
 
-    // Débito: janela deslize — linhas que saem da janela sem insert novo deixam rows_total defasado até o próximo insert ou `r`.
-    if app.last_id != prev_last {
+    // Débito (sem filtro): janela deslize — linhas que saem da janela sem insert novo deixam rows_total defasado até o próximo insert ou `r`.
+    // #28: com filtro o count roda a cada tick — UPDATE pós-insert não muda max_id, e um sinal de UPDATE custaria estado novo.
+    if app.filters.active() || new_last != prev_last {
         app.rows_total = count_rows(store, &app.filters, app.window).await?;
+    }
+    if new_last != prev_last {
         let (total, chats, senders) = totals(store).await?;
         app.total = total;
         app.chats = chats;
         app.senders = senders;
+    }
+    // #33: cursor e feed só depois do recompute OK; falha deixa o gate aberto e o próximo tick re-tenta.
+    app.last_id = new_last;
+    let added = pending.len();
+    if added > 0 {
+        app.feed.extend(pending);
+        if app.feed.len() > FEED_LIMIT {
+            let excess = app.feed.len() - FEED_LIMIT;
+            app.feed.drain(..excess);
+        }
+        if app.selected > 0 {
+            app.selected += added; // mantém a linha em foco enquanto chegam novas
+        }
+        app.clamp_selection();
     }
     app.status.clear();
     Ok(())
@@ -910,7 +919,7 @@ fn build_where(filters: &Filters, window: Window) -> (String, Vec<libsql::Value>
         clauses.push("message_text LIKE ? ESCAPE '\\'".to_string());
         values.push(libsql::Value::Text(format!("%{}%", escape_like(search))));
     }
-    // shortcut: filtros fazem scan; criar índice em timestamp/chat_id se o banco crescer.
+    // shortcut: predicados sem índice (LIKE/tipo/links/msg_kind) ainda fazem scan; timestamp/chat_id já cobertos por idx_messages_timestamp e o autoindex do UNIQUE.
     let where_sql = if clauses.is_empty() {
         String::new()
     } else {
@@ -2236,10 +2245,11 @@ mod tests {
         // Primeiro tick sincroniza last_id com o MAX(id) global (reload só vê o feed filtrado).
         refresh(&mut app, &store).await.unwrap();
 
+        // Com filtro o count roda a cada tick (#28); totals global continua no gate.
         app.total = 999;
         app.rows_total = 999;
         refresh(&mut app, &store).await.unwrap();
-        assert_eq!((app.total, app.rows_total), (999, 999));
+        assert_eq!((app.total, app.rows_total), (999, 1));
 
         // Insert que não casa com o filtro: o total global tem que subir.
         insert(&store, 3, -100, 42, "outra").await;
@@ -2250,6 +2260,81 @@ mod tests {
         insert(&store, 4, -100, 42, "cpf 456").await;
         refresh(&mut app, &store).await.unwrap();
         assert_eq!((app.total, app.rows_total), (4, 2));
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn refresh_com_filtro_reconta_apos_update_sem_insert() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        insert(&store, 1, -100, 42, "anuncio no meio").await;
+        insert(&store, 2, -100, 42, "conversa").await;
+
+        let mut app = App::new();
+        app.window = Window::All;
+        app.filters.hide_ads = true;
+        reload(&mut app, &store).await.unwrap();
+        assert_eq!(app.rows_total, 2);
+
+        // Classificação pós-insert (#28): UPDATE msg_kind muda o conjunto
+        // filtrado sem mexer em max_id, então o count não pode ficar no gate.
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET msg_kind = 'ad' WHERE id = 1",
+                (),
+            )
+            .await
+            .unwrap();
+        refresh(&mut app, &store).await.unwrap();
+        assert_eq!(app.rows_total, 1);
+        assert_eq!(app.total, 2); // totals global é imune a UPDATE
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn refresh_falha_no_recompute_re_tenta_no_proximo_tick() {
+        let path = temp_db();
+        let store = MessageStore::open(&path).await.unwrap();
+        insert(&store, 1, -100, 42, "primeira").await;
+
+        let mut app = App::new();
+        app.window = Window::All;
+        reload(&mut app, &store).await.unwrap();
+        assert_eq!((app.total, app.rows_total), (1, 1));
+
+        insert(&store, 2, -100, 42, "segunda").await;
+        // Quebra só o totals (coluna que só ele referencia); count/live seguem OK.
+        store
+            .conn
+            .execute(
+                "ALTER TABLE messages RENAME COLUMN sender_id TO sender_id_off",
+                (),
+            )
+            .await
+            .unwrap();
+
+        app.status = "erro: injetado".into();
+        assert!(refresh(&mut app, &store).await.is_err());
+        // Cursor e feed intocados: sem isso o próximo tick fecha o gate e o cache fica defasado.
+        assert_eq!(app.last_id, 1);
+        assert_eq!(app.feed.len(), 1);
+        assert_eq!(app.status, "erro: injetado"); // erro só some quando o retry dá certo
+
+        store
+            .conn
+            .execute(
+                "ALTER TABLE messages RENAME COLUMN sender_id_off TO sender_id",
+                (),
+            )
+            .await
+            .unwrap();
+        refresh(&mut app, &store).await.unwrap();
+        assert_eq!((app.last_id, app.total, app.rows_total), (2, 2, 2));
+        assert_eq!(app.feed.len(), 2); // sem duplicar a linha que falhou antes
+        assert!(app.status.is_empty());
 
         cleanup(&path);
     }
