@@ -28,7 +28,7 @@ mod stats;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead as _, Write as _};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use grammers_client::media::{ChatPhoto, Media};
@@ -346,6 +346,22 @@ const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 
 /// Teto do contrato de envio (API_CTI.md): acima disso a foto fica só local.
 const CTI_MAX_MEDIA_BYTES: usize = 8 * 1024 * 1024;
+
+/// SQL do INSERT, montado uma única vez (hot path: uma vez por mensagem).
+/// Só MESSAGE_COLUMNS: colunas extras são preenchidas por UPDATE à parte.
+static INSERT_SQL: LazyLock<String> = LazyLock::new(|| {
+    let columns = MESSAGE_COLUMNS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let marks = MESSAGE_COLUMNS
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT OR IGNORE INTO messages ({columns}) VALUES ({marks})")
+});
 
 fn opt_text(value: &Option<String>) -> libsql::Value {
     match value {
@@ -826,19 +842,9 @@ impl MessageStore {
 
     /// Grava a mensagem. Mensagens repetidas (catch-up) são ignoradas.
     async fn insert(&self, msg: &MonitoredMessage) -> Result<(), String> {
-        let columns = MESSAGE_COLUMNS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let marks = MESSAGE_COLUMNS
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
         self.conn
             .execute(
-                &format!("INSERT OR IGNORE INTO messages ({columns}) VALUES ({marks})"),
+                &INSERT_SQL,
                 libsql::params_from_iter(msg.row_values()),
             )
             .await
@@ -1500,7 +1506,7 @@ fn kind_from_word(word: &str) -> Option<&'static str> {
 // PROCESSAMENTO DE MENSAGENS
 // ============================================================
 
-fn media_type(media: Option<Media>) -> &'static str {
+fn media_type(media: Option<&Media>) -> &'static str {
     match media {
         None => "text",
         Some(Media::Photo(_)) => "photo",
@@ -1546,7 +1552,7 @@ async fn handle_message(
     let has_links =
         text.contains("http://") || text.contains("https://") || text.contains("t.me/");
     let media = message.media();
-    let message_type = media_type(media.clone());
+    let message_type = media_type(media.as_ref());
     let details = media_details(media.as_ref());
 
     let sender = message.sender();
